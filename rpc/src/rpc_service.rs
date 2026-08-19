@@ -157,11 +157,13 @@ where
 
 pub struct JsonRpcService {
     thread_hdl: JoinHandle<()>,
+    metrics_thread_hdl: Option<JoinHandle<()>>,
 
     #[cfg(test)]
     pub request_processor: JsonRpcRequestProcessor, // Used only by test_rpc_new()...
 
     close_handle: Option<CloseHandle>,
+    metrics_close_handle: Option<CloseHandle>,
 
     client_updater: Arc<dyn NotifyKeyUpdate + Send + Sync>,
 }
@@ -386,20 +388,6 @@ impl RpcRequestMiddleware {
         info!("health check: {response}");
         response
     }
-
-    fn metrics_get() -> RequestMiddlewareAction {
-        RequestMiddlewareAction::Respond {
-            should_validate_hosts: true,
-            response: Box::pin(async {
-                Ok(hyper::Response::builder()
-                    .status(hyper::StatusCode::OK)
-                    .header(hyper::header::CONTENT_TYPE, "text/plain; version=0.0.4")
-                    .header(hyper::header::CACHE_CONTROL, "no-store")
-                    .body(hyper::Body::from(solana_metrics::pull_metrics_exposition()))
-                    .unwrap())
-            }),
-        }
-    }
 }
 
 impl RequestMiddleware for RpcRequestMiddleware {
@@ -460,16 +448,48 @@ impl RequestMiddleware for RpcRequestMiddleware {
                 .body(hyper::Body::from(self.health_check()))
                 .unwrap()
                 .into()
-        } else if is_metrics_request(request.method(), request.uri().path()) {
-            Self::metrics_get()
         } else {
             request.into()
         }
     }
 }
 
-fn is_metrics_request(method: &hyper::Method, path: &str) -> bool {
-    method == hyper::Method::GET && path == "/metrics"
+struct MetricsRequestMiddleware;
+
+impl MetricsRequestMiddleware {
+    fn response(status: hyper::StatusCode) -> RequestMiddlewareAction {
+        RequestMiddlewareAction::Respond {
+            should_validate_hosts: false,
+            response: Box::pin(async move {
+                Ok(hyper::Response::builder()
+                    .status(status)
+                    .body(hyper::Body::empty())
+                    .unwrap())
+            }),
+        }
+    }
+}
+
+impl RequestMiddleware for MetricsRequestMiddleware {
+    fn on_request(&self, request: hyper::Request<hyper::Body>) -> RequestMiddlewareAction {
+        if request.method() == hyper::Method::GET && request.uri().path() == "/metrics" {
+            RequestMiddlewareAction::Respond {
+                should_validate_hosts: false,
+                response: Box::pin(async {
+                    Ok(hyper::Response::builder()
+                        .status(hyper::StatusCode::OK)
+                        .header(hyper::header::CONTENT_TYPE, "text/plain; version=0.0.4")
+                        .header(hyper::header::CACHE_CONTROL, "no-store")
+                        .body(hyper::Body::from(solana_metrics::pull_metrics_exposition()))
+                        .unwrap())
+                }),
+            }
+        } else if request.uri().path() == "/metrics" {
+            Self::response(hyper::StatusCode::METHOD_NOT_ALLOWED)
+        } else {
+            Self::response(hyper::StatusCode::NOT_FOUND)
+        }
+    }
 }
 
 fn match_supply_path(path: &str) -> Option<&str> {
@@ -539,6 +559,7 @@ fn process_rest(bank_forks: &Arc<RwLock<BankForks>>, path: &str) -> RequestMiddl
 /// `client_option`.
 pub struct JsonRpcServiceConfig<'a> {
     pub rpc_addr: SocketAddr,
+    pub metrics_addr: Option<SocketAddr>,
     pub rpc_config: JsonRpcConfig,
     pub snapshot_config: Option<SnapshotConfig>,
     pub bank_forks: Arc<RwLock<BankForks>>,
@@ -594,6 +615,7 @@ impl JsonRpcService {
 
         let json_rpc_service = Self::new(
             config.rpc_addr,
+            config.metrics_addr,
             config.rpc_config.clone(),
             config.snapshot_config,
             config.bank_forks.clone(),
@@ -627,6 +649,7 @@ impl JsonRpcService {
             + 'static,
     >(
         rpc_addr: SocketAddr,
+        metrics_addr: Option<SocketAddr>,
         config: JsonRpcConfig,
         snapshot_config: Option<SnapshotConfig>,
         bank_forks: Arc<RwLock<BankForks>>,
@@ -813,18 +836,56 @@ impl JsonRpcService {
             .unwrap();
 
         let close_handle = close_handle_receiver.recv().unwrap()?;
+        let (metrics_thread_hdl, metrics_close_handle) = if let Some(metrics_addr) = metrics_addr {
+            let (sender, receiver) = unbounded();
+            let metrics_thread_hdl = Builder::new()
+                .name("solMetricsSvc".to_string())
+                .spawn(move || {
+                    let server = ServerBuilder::new(MetaIoHandler::default())
+                        .threads(1)
+                        .request_middleware(MetricsRequestMiddleware)
+                        .start_http(&metrics_addr);
+                    match server {
+                        Ok(server) => {
+                            sender.send(Ok(server.close_handle())).unwrap();
+                            server.wait();
+                        }
+                        Err(error) => {
+                            sender.send(Err(error.to_string())).unwrap();
+                        }
+                    }
+                })
+                .unwrap();
+            match receiver.recv().unwrap() {
+                Ok(close_handle) => (Some(metrics_thread_hdl), Some(close_handle)),
+                Err(error) => {
+                    close_handle.close();
+                    metrics_thread_hdl.join().unwrap();
+                    thread_hdl.join().unwrap();
+                    return Err(error);
+                }
+            }
+        } else {
+            (None, None)
+        };
         let close_handle_ = close_handle.clone();
+        let metrics_close_handle_ = metrics_close_handle.clone();
         validator_exit
             .write()
             .unwrap()
             .register_exit(Box::new(move || {
                 close_handle_.close();
+                if let Some(close_handle) = &metrics_close_handle_ {
+                    close_handle.close();
+                }
             }));
         Ok(Self {
             thread_hdl,
+            metrics_thread_hdl,
             #[cfg(test)]
             request_processor: test_request_processor,
             close_handle: Some(close_handle),
+            metrics_close_handle,
             client_updater: Arc::new(client) as Arc<dyn NotifyKeyUpdate + Send + Sync>,
         })
     }
@@ -833,11 +894,18 @@ impl JsonRpcService {
         if let Some(c) = self.close_handle.take() {
             c.close()
         }
+        if let Some(c) = self.metrics_close_handle.take() {
+            c.close()
+        }
     }
 
     pub fn join(mut self) -> thread::Result<()> {
         self.exit();
-        self.thread_hdl.join()
+        self.thread_hdl.join()?;
+        if let Some(thread_hdl) = self.metrics_thread_hdl {
+            thread_hdl.join()?;
+        }
+        Ok(())
     }
 
     pub fn get_client_key_updater(&self) -> Arc<dyn NotifyKeyUpdate + Send + Sync> {
@@ -945,6 +1013,7 @@ mod tests {
         );
         let mut rpc_service = JsonRpcService::new(
             rpc_addr,
+            None,
             json_rpc_config,
             None,
             bank_forks,
@@ -982,11 +1051,67 @@ mod tests {
     }
 
     #[test]
-    fn test_metrics_route_is_private_and_read_only() {
-        assert!(is_metrics_request(&hyper::Method::GET, "/metrics"));
-        assert!(!is_metrics_request(&hyper::Method::POST, "/metrics"));
-        assert!(!is_metrics_request(&hyper::Method::GET, "/metrics/"));
-        assert!(!is_metrics_request(&hyper::Method::GET, "/"));
+    fn test_json_rpc_listener_does_not_serve_metrics() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
+        let bank_forks = create_bank_forks();
+        let optimistically_confirmed_bank =
+            OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
+        let middleware = RpcRequestMiddleware::new(
+            ledger_path.path().to_path_buf(),
+            None,
+            bank_forks,
+            RpcHealth::stub(optimistically_confirmed_bank, blockstore),
+        );
+        let request = hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri("/metrics")
+            .body(hyper::Body::empty())
+            .unwrap();
+        assert!(matches!(
+            middleware.on_request(request),
+            RequestMiddlewareAction::Proceed { .. }
+        ));
+    }
+
+    #[test]
+    fn test_metrics_listener_serves_only_get_metrics() {
+        let runtime = Runtime::new().unwrap();
+        let middleware = MetricsRequestMiddleware;
+        let get = hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri("/metrics")
+            .body(hyper::Body::empty())
+            .unwrap();
+        let response = match middleware.on_request(get) {
+            RequestMiddlewareAction::Respond { response, .. } => {
+                runtime.block_on(response).unwrap()
+            }
+            RequestMiddlewareAction::Proceed { .. } => panic!("metrics request proceeded"),
+        };
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+
+        for (method, path, status) in [
+            (
+                hyper::Method::POST,
+                "/metrics",
+                hyper::StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (hyper::Method::GET, "/", hyper::StatusCode::NOT_FOUND),
+        ] {
+            let request = hyper::Request::builder()
+                .method(method)
+                .uri(path)
+                .body(hyper::Body::empty())
+                .unwrap();
+            let response = match middleware.on_request(request) {
+                RequestMiddlewareAction::Respond { response, .. } => {
+                    runtime.block_on(response).unwrap()
+                }
+                RequestMiddlewareAction::Proceed { .. } => panic!("metrics request proceeded"),
+            };
+            assert_eq!(response.status(), status);
+        }
     }
 
     fn create_bank_forks() -> Arc<RwLock<BankForks>> {
