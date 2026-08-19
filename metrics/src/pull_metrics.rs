@@ -76,7 +76,11 @@ impl PullMetrics {
 
     pub fn finish_rpc_request(&self, slot: usize) {
         if let Some(counter) = self.rpc_in_flight_by_method.get(slot) {
-            counter.fetch_sub(1, Ordering::Relaxed);
+            // Keep the gauge valid even if a caller accidentally finishes a
+            // request more than once.  In particular, never wrap to u64::MAX.
+            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_sub(1)
+            });
         }
     }
 
@@ -210,6 +214,14 @@ mod tests {
         assert!(output.contains("agave_rpc_requests_total{method=\"other\"} 1\n"));
         assert!(output.contains("agave_rpc_in_flight{method=\"other\"} 0\n"));
         assert!(!output.contains("method_"));
+    }
+
+    #[test]
+    fn finishing_without_an_in_flight_request_does_not_underflow() {
+        let metrics = PullMetrics::default();
+        metrics.finish_rpc_request(rpc_method_slot("getHealth"));
+        let output = metrics.exposition();
+        assert!(output.contains("agave_rpc_in_flight{method=\"getHealth\"} 0\n"));
     }
 
     #[test]
