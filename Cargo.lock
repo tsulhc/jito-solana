@@ -424,8 +424,8 @@ dependencies = [
  "symlink",
  "tempfile",
  "test-case",
- "thiserror 2.0.18",
- "tikv-jemallocator",
+  "thiserror 2.0.18",
+  "tikv-jemallocator",
  "tokio",
  "tonic",
  "url 2.5.8",
@@ -7249,8 +7249,8 @@ dependencies = [
  "strum_macros",
  "tempfile",
  "test-case",
- "thiserror 2.0.18",
- "tikv-jemallocator",
+  "thiserror 2.0.18",
+  "tikv-jemallocator",
 ]
 
 [[package]]
@@ -8225,9 +8225,9 @@ dependencies = [
  "solana-validator-exit",
  "solana-version",
  "solana-vote",
- "solana-vote-interface",
- "solana-vote-program",
- "spl-memo-interface",
+  "solana-vote-interface",
+  "solana-vote-program",
+  "spl-memo-interface",
  "static_assertions",
  "strum",
  "strum_macros",
@@ -8235,8 +8235,9 @@ dependencies = [
  "sysctl",
  "tempfile",
  "test-case",
- "thiserror 2.0.18",
- "tikv-jemallocator",
+  "thiserror 2.0.18",
+  "tikv-jemalloc-ctl",
+  "tikv-jemallocator",
  "tokio",
  "tokio-stream",
  "tokio-util 0.7.18",
@@ -12490,6 +12491,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d050e60b33d41c19108b32cea32164033a9013fe3b46cbd4457559bfbf77afaa"
 dependencies = [
  "num_cpus",
+]
+
+[[package]]
+name = "tikv-jemalloc-ctl"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f21f216790c8df74ce3ab25b534e0718da5a1916719771d3fec23315c99e468b"
+dependencies = [
+ "libc",
+ "tikv-jemalloc-sys",
 ]
 
 [[package]]
