@@ -2096,6 +2096,19 @@ impl AccountsDb {
         measure_all.stop();
 
         self.clean_accounts_stats.report();
+        let active_scans = self.scan_tracker.active_scans.load(Ordering::Relaxed);
+        let max_distance_to_min_scan_slot = self
+            .scan_tracker
+            .max_distance_to_min_scan_slot
+            .swap(0, Ordering::Relaxed);
+        let pull_metrics = solana_metrics::pull_metrics();
+        pull_metrics
+            .accounts_scan_active
+            .store(active_scans as u64, Ordering::Relaxed);
+        pull_metrics
+            .accounts_scan_max_root_distance
+            .store(max_distance_to_min_scan_slot, Ordering::Relaxed);
+
         datapoint_info!(
             "clean_accounts",
             ("max_clean_root", max_clean_root_inclusive, Option<i64>),
@@ -2214,13 +2227,12 @@ impl AccountsDb {
             ),
             (
                 "active_scans",
-                self.scan_tracker.active_scans.load(Ordering::Relaxed),
+                active_scans,
                 i64
             ),
             (
                 "max_distance_to_min_scan_slot",
-                self.scan_tracker.max_distance_to_min_scan_slot
-                    .swap(0, Ordering::Relaxed),
+                max_distance_to_min_scan_slot,
                 i64
             ),
             (

@@ -33,10 +33,11 @@ pub fn rpc_method_slot(method: &str) -> usize {
 }
 
 pub struct PullMetrics {
-    pub accounts_index_bytes: AtomicU64,
-    pub accounts_index_entries: AtomicU64,
-    pub accounts_scan_total: AtomicU64,
-    pub accounts_scan_in_flight: AtomicU64,
+    pub accounts_index_count_in_mem: AtomicU64,
+    pub accounts_index_capacity_in_mem: AtomicU64,
+    pub accounts_index_estimate_mem_bytes: AtomicU64,
+    pub accounts_scan_active: AtomicU64,
+    pub accounts_scan_max_root_distance: AtomicU64,
     pub jemalloc_allocated_bytes: AtomicU64,
     pub jemalloc_resident_bytes: AtomicU64,
     pub jemalloc_active_bytes: AtomicU64,
@@ -48,10 +49,11 @@ pub struct PullMetrics {
 impl Default for PullMetrics {
     fn default() -> Self {
         Self {
-            accounts_index_bytes: AtomicU64::new(0),
-            accounts_index_entries: AtomicU64::new(0),
-            accounts_scan_total: AtomicU64::new(0),
-            accounts_scan_in_flight: AtomicU64::new(0),
+            accounts_index_count_in_mem: AtomicU64::new(0),
+            accounts_index_capacity_in_mem: AtomicU64::new(0),
+            accounts_index_estimate_mem_bytes: AtomicU64::new(0),
+            accounts_scan_active: AtomicU64::new(0),
+            accounts_scan_max_root_distance: AtomicU64::new(0),
             jemalloc_allocated_bytes: AtomicU64::new(0),
             jemalloc_resident_bytes: AtomicU64::new(0),
             jemalloc_active_bytes: AtomicU64::new(0),
@@ -88,12 +90,22 @@ impl PullMetrics {
                 output.push('\n');
             };
         }
-        gauge!("agave_accounts_index_bytes", self.accounts_index_bytes);
-        gauge!("agave_accounts_index_entries", self.accounts_index_entries);
-        gauge!("agave_accounts_scan_total", self.accounts_scan_total);
         gauge!(
-            "agave_accounts_scan_in_flight",
-            self.accounts_scan_in_flight
+            "agave_accounts_index_count_in_mem",
+            self.accounts_index_count_in_mem
+        );
+        gauge!(
+            "agave_accounts_index_capacity_in_mem",
+            self.accounts_index_capacity_in_mem
+        );
+        gauge!(
+            "agave_accounts_index_estimate_mem_bytes",
+            self.accounts_index_estimate_mem_bytes
+        );
+        gauge!("agave_accounts_scan_active", self.accounts_scan_active);
+        gauge!(
+            "agave_accounts_scan_max_root_distance",
+            self.accounts_scan_max_root_distance
         );
         gauge!(
             "agave_jemalloc_allocated_bytes",
@@ -135,10 +147,26 @@ mod tests {
     #[test]
     fn updates_are_reflected_at_scrape_time() {
         let metrics = PullMetrics::default();
-        metrics.accounts_index_bytes.store(42, Ordering::Relaxed);
+        metrics
+            .accounts_index_count_in_mem
+            .store(42, Ordering::Relaxed);
+        metrics
+            .accounts_index_capacity_in_mem
+            .store(84, Ordering::Relaxed);
+        metrics
+            .accounts_index_estimate_mem_bytes
+            .store(168, Ordering::Relaxed);
+        metrics.accounts_scan_active.store(2, Ordering::Relaxed);
+        metrics
+            .accounts_scan_max_root_distance
+            .store(7, Ordering::Relaxed);
         metrics.record_rpc_request(3);
         let output = metrics.exposition();
-        assert!(output.contains("agave_accounts_index_bytes 42\n"));
+        assert!(output.contains("agave_accounts_index_count_in_mem 42\n"));
+        assert!(output.contains("agave_accounts_index_capacity_in_mem 84\n"));
+        assert!(output.contains("agave_accounts_index_estimate_mem_bytes 168\n"));
+        assert!(output.contains("agave_accounts_scan_active 2\n"));
+        assert!(output.contains("agave_accounts_scan_max_root_distance 7\n"));
         assert!(output.contains("agave_rpc_requests_total{method=\"getHealth\"} 1\n"));
         assert!(output.contains("agave_rpc_in_flight{method=\"getHealth\"} 1\n"));
     }
