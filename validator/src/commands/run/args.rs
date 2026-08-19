@@ -5,7 +5,7 @@ use {
         commands::{FromClapArgMatches, Result, bam},
     },
     agave_snapshots::{SUPPORTED_ARCHIVE_COMPRESSION, SnapshotVersion},
-    clap::{App, Arg, ArgMatches, values_t},
+    clap::{App, Arg, ArgMatches, value_t, values_t},
     solana_accounts_db::utils::create_and_canonicalize_directory,
     solana_clap_utils::{
         hidden_unless_forced,
@@ -58,6 +58,7 @@ pub struct RunArgs {
     pub pub_sub_config: PubSubConfig,
     pub send_transaction_service_config: SendTransactionServiceConfig,
     pub filter_keys: HashSet<Pubkey>,
+    pub metrics_addr: Option<SocketAddr>,
 }
 
 impl FromClapArgMatches for RunArgs {
@@ -137,6 +138,18 @@ impl FromClapArgMatches for RunArgs {
                     .collect()
             } else {
                 HashSet::new()
+            },
+            metrics_addr: if matches.is_present("metrics_bind_address") {
+                if matches.value_of("rpc_port").is_none() {
+                    return Err(clap::Error::with_description(
+                        "The --metrics-bind-address argument requires --rpc-port (RPC enabled)",
+                        clap::ErrorKind::ArgumentNotFound,
+                    )
+                    .into());
+                }
+                Some(value_t!(matches, "metrics_bind_address", SocketAddr)?)
+            } else {
+                None
             },
         })
     }
@@ -242,6 +255,24 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .long("private-rpc")
             .takes_value(false)
             .help("Do not publish the RPC port for use by others"),
+    )
+    .arg(
+        Arg::with_name("metrics_bind_address")
+            .long("metrics-bind-address")
+            .value_name("HOST:PORT")
+            .takes_value(true)
+            .validator(|value| {
+                value
+                    .parse::<SocketAddr>()
+                    .map(|_| ())
+                    .map_err(|err| format!("invalid metrics bind address: {err}"))
+            })
+            .requires("rpc_port")
+            .help(
+                "Enable the Prometheus metrics listener on the given HOST:PORT (e.g. \
+                 127.0.0.1:9100). The listener has no authentication and must only be \
+                 bound to loopback or other private, trusted interfaces.",
+            ),
     )
     .arg(
         Arg::with_name("no_port_check")
@@ -1447,6 +1478,7 @@ mod tests {
                 },
                 send_transaction_service_config: SendTransactionServiceConfig::default(),
                 filter_keys: HashSet::new(),
+                metrics_addr: None,
             }
         }
     }
@@ -1466,6 +1498,7 @@ mod tests {
                 pub_sub_config: self.pub_sub_config.clone(),
                 send_transaction_service_config: self.send_transaction_service_config.clone(),
                 filter_keys: self.filter_keys.clone(),
+                metrics_addr: self.metrics_addr,
             }
         }
     }
@@ -1972,5 +2005,79 @@ mod tests {
             vec!["--allow-private-addr"],
             expected_args,
         );
+    }
+
+    #[test]
+    fn metrics_bind_address_absent_is_disabled() {
+        let default_run_args = RunArgs::default();
+        let default_args = DefaultArgs::default();
+        let matches = add_args(App::new("run_command"), &default_args).get_matches_from(vec![
+            "run_command",
+            "--identity",
+            identity_file(&default_run_args).to_str().unwrap(),
+            "--rpc-port",
+            "8899",
+        ]);
+        let run_args = RunArgs::from_clap_arg_match(&matches).unwrap();
+        assert_eq!(run_args.metrics_addr, None);
+    }
+
+    #[test]
+    fn metrics_bind_address_valid_parses_to_socket_addr() {
+        let default_run_args = RunArgs::default();
+        let default_args = DefaultArgs::default();
+        let matches = add_args(App::new("run_command"), &default_args).get_matches_from(vec![
+            "run_command",
+            "--identity",
+            identity_file(&default_run_args).to_str().unwrap(),
+            "--rpc-port",
+            "8899",
+            "--metrics-bind-address",
+            "127.0.0.1:9100",
+        ]);
+        let run_args = RunArgs::from_clap_arg_match(&matches).unwrap();
+        assert_eq!(
+            run_args.metrics_addr,
+            Some(SocketAddr::from(([127, 0, 0, 1], 9100)))
+        );
+    }
+
+    #[test]
+    fn metrics_bind_address_invalid_is_rejected() {
+        let default_run_args = RunArgs::default();
+        let default_args = DefaultArgs::default();
+        let result = add_args(App::new("run_command"), &default_args).get_matches_from_safe(vec![
+            "run_command",
+            "--identity",
+            identity_file(&default_run_args).to_str().unwrap(),
+            "--rpc-port",
+            "8899",
+            "--metrics-bind-address",
+            "not-an-address",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn metrics_bind_address_requires_rpc_enabled() {
+        let default_run_args = RunArgs::default();
+        let default_args = DefaultArgs::default();
+        let result = add_args(App::new("run_command"), &default_args).get_matches_from_safe(vec![
+            "run_command",
+            "--identity",
+            identity_file(&default_run_args).to_str().unwrap(),
+            "--metrics-bind-address",
+            "127.0.0.1:9100",
+        ]);
+        assert!(result.is_err());
+    }
+
+    fn identity_file(run_args: &RunArgs) -> PathBuf {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let file = tmp_dir.path().join("id.json");
+        solana_keypair::write_keypair_file(&run_args.identity_keypair, &file).unwrap();
+        // keep the temp dir alive for the duration of the test
+        std::mem::forget(tmp_dir);
+        file
     }
 }

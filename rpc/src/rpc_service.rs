@@ -841,7 +841,7 @@ impl JsonRpcService {
             let metrics_thread_hdl = Builder::new()
                 .name("solMetricsSvc".to_string())
                 .spawn(move || {
-                    let server = ServerBuilder::new(MetaIoHandler::default())
+                    let server = ServerBuilder::<()>::new(MetaIoHandler::default())
                         .threads(1)
                         .request_middleware(MetricsRequestMiddleware)
                         .start_http(&metrics_addr);
@@ -876,7 +876,7 @@ impl JsonRpcService {
             .register_exit(Box::new(move || {
                 close_handle_.close();
                 if let Some(close_handle) = &metrics_close_handle_ {
-                    close_handle.close();
+                    close_handle.clone().close();
                 }
             }));
         Ok(Self {

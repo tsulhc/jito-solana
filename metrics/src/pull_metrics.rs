@@ -225,6 +225,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn catalog_cardinality_is_bounded() {
         assert!(RPC_METHOD_SLOTS <= 128);
         assert_eq!(RPC_METHOD_SLOTS, RPC_METHOD_LABELS.len());
