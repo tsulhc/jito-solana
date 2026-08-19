@@ -2101,13 +2101,11 @@ impl AccountsDb {
             .scan_tracker
             .max_distance_to_min_scan_slot
             .swap(0, Ordering::Relaxed);
-        let pull_metrics = solana_metrics::pull_metrics();
-        pull_metrics
-            .accounts_scan_active
-            .store(active_scans as u64, Ordering::Relaxed);
-        pull_metrics
-            .accounts_scan_max_root_distance
-            .store(max_distance_to_min_scan_slot, Ordering::Relaxed);
+        publish_scan_metrics(
+            solana_metrics::pull_metrics(),
+            active_scans,
+            max_distance_to_min_scan_slot,
+        );
 
         datapoint_info!(
             "clean_accounts",
@@ -6707,6 +6705,19 @@ impl AccountsDb {
             );
         }
     }
+}
+
+fn publish_scan_metrics(
+    metrics: &solana_metrics::PullMetrics,
+    active_scans: usize,
+    max_distance_to_min_scan_slot: u64,
+) {
+    metrics
+        .accounts_scan_active
+        .store(active_scans as u64, Ordering::Relaxed);
+    metrics
+        .accounts_scan_max_root_distance
+        .store(max_distance_to_min_scan_slot, Ordering::Relaxed);
 }
 
 /// Specify whether obsolete accounts should be marked or not during reclaims

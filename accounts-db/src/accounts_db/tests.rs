@@ -28,6 +28,32 @@ use {
     test_case::{test_case, test_matrix},
 };
 
+#[test]
+fn publish_scan_metrics_reuses_values_and_reset_sample() {
+    let metrics = solana_metrics::PullMetrics::default();
+    publish_scan_metrics(&metrics, 3, 17);
+    assert_eq!(
+        metrics
+            .accounts_scan_active
+            .load(Ordering::Relaxed),
+        3
+    );
+    assert_eq!(
+        metrics
+            .accounts_scan_max_root_distance
+            .load(Ordering::Relaxed),
+        17
+    );
+    publish_scan_metrics(&metrics, 0, 0);
+    assert_eq!(metrics.accounts_scan_active.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        metrics
+            .accounts_scan_max_root_distance
+            .load(Ordering::Relaxed),
+        0
+    );
+}
+
 const DEFAULT_FILE_SIZE: u64 = 4 * 1024 * 1024;
 
 fn linear_ancestors(end_slot: u64) -> Ancestors {
