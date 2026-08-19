@@ -3,11 +3,26 @@
 pub mod counter;
 pub mod datapoint;
 pub mod metrics;
+pub mod pull_metrics;
 pub use crate::metrics::{flush, query, set_host_id, set_panic_hook, submit};
+pub use crate::pull_metrics::{PullMetrics, RPC_METHOD_SLOTS};
+use std::sync::OnceLock;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
+
+static PULL_METRICS: OnceLock<PullMetrics> = OnceLock::new();
+
+/// Process-wide pull metrics registry. Producers retain only this lock-free handle.
+pub fn pull_metrics() -> &'static PullMetrics {
+    PULL_METRICS.get_or_init(PullMetrics::default)
+}
+
+/// Render the private metrics endpoint response.
+pub fn pull_metrics_exposition() -> String {
+    pull_metrics().exposition()
+}
 
 // To track an external counter which cannot be reset and is always increasing
 #[derive(Default)]

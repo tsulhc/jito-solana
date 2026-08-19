@@ -342,6 +342,20 @@ impl RpcRequestMiddleware {
         info!("health check: {response}");
         response
     }
+
+    fn metrics_get() -> RequestMiddlewareAction {
+        RequestMiddlewareAction::Respond {
+            should_validate_hosts: true,
+            response: Box::pin(async {
+                Ok(hyper::Response::builder()
+                    .status(hyper::StatusCode::OK)
+                    .header(hyper::header::CONTENT_TYPE, "text/plain; version=0.0.4")
+                    .header(hyper::header::CACHE_CONTROL, "no-store")
+                    .body(hyper::Body::from(solana_metrics::pull_metrics_exposition()))
+                    .unwrap())
+            }),
+        }
+    }
 }
 
 impl RequestMiddleware for RpcRequestMiddleware {
@@ -402,10 +416,16 @@ impl RequestMiddleware for RpcRequestMiddleware {
                 .body(hyper::Body::from(self.health_check()))
                 .unwrap()
                 .into()
+        } else if is_metrics_request(request.method(), request.uri().path()) {
+            Self::metrics_get()
         } else {
             request.into()
         }
     }
+}
+
+fn is_metrics_request(method: &hyper::Method, path: &str) -> bool {
+    method == hyper::Method::GET && path == "/metrics"
 }
 
 fn match_supply_path(path: &str) -> Option<&str> {
@@ -915,6 +935,14 @@ mod tests {
         );
         rpc_service.exit();
         rpc_service.join().unwrap();
+    }
+
+    #[test]
+    fn test_metrics_route_is_private_and_read_only() {
+        assert!(is_metrics_request(&hyper::Method::GET, "/metrics"));
+        assert!(!is_metrics_request(&hyper::Method::POST, "/metrics"));
+        assert!(!is_metrics_request(&hyper::Method::GET, "/metrics/"));
+        assert!(!is_metrics_request(&hyper::Method::GET, "/"));
     }
 
     fn create_bank_forks() -> Arc<RwLock<BankForks>> {
