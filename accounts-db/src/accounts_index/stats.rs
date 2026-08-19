@@ -7,6 +7,7 @@ use {
     solana_time_utils::AtomicInterval,
     std::{
         fmt::Debug,
+        mem::size_of,
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
