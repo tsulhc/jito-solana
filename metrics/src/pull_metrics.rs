@@ -6,74 +6,31 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The number of method slots reserved for RPC instrumentation.
-pub const RPC_METHOD_SLOTS: usize = 64;
+pub const RPC_METHOD_SLOTS: usize = 54;
 
 const RPC_METHOD_LABELS: [&str; RPC_METHOD_SLOTS] = [
-    "method_0",
-    "method_1",
-    "method_2",
-    "method_3",
-    "method_4",
-    "method_5",
-    "method_6",
-    "method_7",
-    "method_8",
-    "method_9",
-    "method_10",
-    "method_11",
-    "method_12",
-    "method_13",
-    "method_14",
-    "method_15",
-    "method_16",
-    "method_17",
-    "method_18",
-    "method_19",
-    "method_20",
-    "method_21",
-    "method_22",
-    "method_23",
-    "method_24",
-    "method_25",
-    "method_26",
-    "method_27",
-    "method_28",
-    "method_29",
-    "method_30",
-    "method_31",
-    "method_32",
-    "method_33",
-    "method_34",
-    "method_35",
-    "method_36",
-    "method_37",
-    "method_38",
-    "method_39",
-    "method_40",
-    "method_41",
-    "method_42",
-    "method_43",
-    "method_44",
-    "method_45",
-    "method_46",
-    "method_47",
-    "method_48",
-    "method_49",
-    "method_50",
-    "method_51",
-    "method_52",
-    "method_53",
-    "method_54",
-    "method_55",
-    "method_56",
-    "method_57",
-    "method_58",
-    "method_59",
-    "method_60",
-    "method_61",
-    "method_62",
-    "method_63",
+    "getBalance", "getEpochInfo", "getGenesisHash", "getHealth", "getIdentity", "getSlot",
+    "getBlockHeight", "getHighestSnapshotSlot", "getTransactionCount", "getVersion",
+    "getVoteAccounts", "getLeaderSchedule", "getMinimumBalanceForRentExemption",
+    "getInflationGovernor", "getInflationRate", "getEpochSchedule", "getSlotLeader",
+    "getSlotLeaders", "getBlockProduction", "getAccountInfo", "getMultipleAccounts",
+    "getBlockCommitment", "getTokenAccountBalance", "getTokenSupply", "getProgramAccounts",
+    "getLargestAccounts", "getSupply", "getTokenLargestAccounts", "getTokenAccountsByOwner",
+    "getTokenAccountsByDelegate", "getInflationReward", "getClusterNodes",
+    "getRecentPerformanceSamples", "getSignatureStatuses", "getMaxRetransmitSlot",
+    "getMaxShredInsertSlot", "requestAirdrop", "sendTransaction", "simulateTransaction",
+    "simulateBundle", "minimumLedgerSlot", "getBlock", "getBlockTime", "getBlocks",
+    "getBlocksWithLimit", "getTransaction", "getSignaturesForAddress", "getFirstAvailableBlock",
+    "getLatestBlockhash", "isBlockhashValid", "getFeeForMessage", "getStakeMinimumDelegation",
+    "getRecentPrioritizationFees", "other",
 ];
+
+pub fn rpc_method_slot(method: &str) -> usize {
+    RPC_METHOD_LABELS[..RPC_METHOD_SLOTS - 1]
+        .iter()
+        .position(|known| *known == method)
+        .unwrap_or(RPC_METHOD_SLOTS - 1)
+}
 
 pub struct PullMetrics {
     pub accounts_index_bytes: AtomicU64,
@@ -84,7 +41,6 @@ pub struct PullMetrics {
     pub jemalloc_resident_bytes: AtomicU64,
     pub jemalloc_active_bytes: AtomicU64,
     pub jemalloc_metadata_bytes: AtomicU64,
-    pub rpc_in_flight: AtomicU64,
     rpc_calls: [AtomicU64; RPC_METHOD_SLOTS],
     rpc_in_flight_by_method: [AtomicU64; RPC_METHOD_SLOTS],
 }
@@ -100,7 +56,6 @@ impl Default for PullMetrics {
             jemalloc_resident_bytes: AtomicU64::new(0),
             jemalloc_active_bytes: AtomicU64::new(0),
             jemalloc_metadata_bytes: AtomicU64::new(0),
-            rpc_in_flight: AtomicU64::new(0),
             rpc_calls: std::array::from_fn(|_| AtomicU64::new(0)),
             rpc_in_flight_by_method: std::array::from_fn(|_| AtomicU64::new(0)),
         }
@@ -108,17 +63,18 @@ impl Default for PullMetrics {
 }
 
 impl PullMetrics {
-    /// Increment a bounded RPC method counter. Out-of-range slots are ignored.
-    pub fn increment_rpc_method(&self, slot: usize) {
+    pub fn record_rpc_request(&self, slot: usize) {
         if let Some(counter) = self.rpc_calls.get(slot) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(counter) = self.rpc_in_flight_by_method.get(slot) {
             counter.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    /// Adjust the bounded in-flight count for an RPC method.
-    pub fn set_rpc_method_in_flight(&self, slot: usize, value: u64) {
+    pub fn finish_rpc_request(&self, slot: usize) {
         if let Some(counter) = self.rpc_in_flight_by_method.get(slot) {
-            counter.store(value, Ordering::Relaxed);
+            counter.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
@@ -132,34 +88,33 @@ impl PullMetrics {
                 output.push('\n');
             };
         }
-        gauge!("solana_accounts_index_bytes", self.accounts_index_bytes);
-        gauge!("solana_accounts_index_entries", self.accounts_index_entries);
-        gauge!("solana_accounts_scan_total", self.accounts_scan_total);
+        gauge!("agave_accounts_index_bytes", self.accounts_index_bytes);
+        gauge!("agave_accounts_index_entries", self.accounts_index_entries);
+        gauge!("agave_accounts_scan_total", self.accounts_scan_total);
         gauge!(
-            "solana_accounts_scan_in_flight",
+            "agave_accounts_scan_in_flight",
             self.accounts_scan_in_flight
         );
         gauge!(
-            "solana_jemalloc_allocated_bytes",
+            "agave_jemalloc_allocated_bytes",
             self.jemalloc_allocated_bytes
         );
         gauge!(
-            "solana_jemalloc_resident_bytes",
+            "agave_jemalloc_resident_bytes",
             self.jemalloc_resident_bytes
         );
-        gauge!("solana_jemalloc_active_bytes", self.jemalloc_active_bytes);
+        gauge!("agave_jemalloc_active_bytes", self.jemalloc_active_bytes);
         gauge!(
-            "solana_jemalloc_metadata_bytes",
+            "agave_jemalloc_metadata_bytes",
             self.jemalloc_metadata_bytes
         );
-        gauge!("solana_rpc_in_flight", self.rpc_in_flight);
         for (slot, label) in RPC_METHOD_LABELS.iter().enumerate() {
-            output.push_str("solana_rpc_calls_total{method=\"");
+            output.push_str("agave_rpc_requests_total{method=\"");
             output.push_str(label);
             output.push_str("\"} ");
             output.push_str(&self.rpc_calls[slot].load(Ordering::Relaxed).to_string());
             output.push('\n');
-            output.push_str("solana_rpc_in_flight{method=\"");
+            output.push_str("agave_rpc_in_flight{method=\"");
             output.push_str(label);
             output.push_str("\"} ");
             output.push_str(
@@ -181,13 +136,41 @@ mod tests {
     fn updates_are_reflected_at_scrape_time() {
         let metrics = PullMetrics::default();
         metrics.accounts_index_bytes.store(42, Ordering::Relaxed);
-        metrics.increment_rpc_method(3);
-        metrics.set_rpc_method_in_flight(3, 2);
-        metrics.increment_rpc_method(RPC_METHOD_SLOTS);
+        metrics.record_rpc_request(3);
         let output = metrics.exposition();
-        assert!(output.contains("solana_accounts_index_bytes 42\n"));
-        assert!(output.contains("solana_rpc_calls_total{method=\"method_3\"} 1\n"));
-        assert!(output.contains("solana_rpc_in_flight{method=\"method_3\"} 2\n"));
-        assert!(!output.contains("method_64"));
+        assert!(output.contains("agave_accounts_index_bytes 42\n"));
+        assert!(output.contains("agave_rpc_requests_total{method=\"getHealth\"} 1\n"));
+        assert!(output.contains("agave_rpc_in_flight{method=\"getHealth\"} 1\n"));
+    }
+
+    #[test]
+    fn totals_and_in_flight_are_independent() {
+        let metrics = PullMetrics::default();
+        let slot = rpc_method_slot("getBalance");
+        metrics.record_rpc_request(slot);
+        metrics.record_rpc_request(slot);
+        metrics.finish_rpc_request(slot);
+        let output = metrics.exposition();
+        assert!(output.contains("agave_rpc_requests_total{method=\"getBalance\"} 2\n"));
+        assert!(output.contains("agave_rpc_in_flight{method=\"getBalance\"} 1\n"));
+    }
+
+    #[test]
+    fn unknown_methods_use_the_bounded_other_slot() {
+        let metrics = PullMetrics::default();
+        let slot = rpc_method_slot("notRegistered");
+        assert_eq!(slot, RPC_METHOD_SLOTS - 1);
+        metrics.record_rpc_request(slot);
+        metrics.finish_rpc_request(slot);
+        let output = metrics.exposition();
+        assert!(output.contains("agave_rpc_requests_total{method=\"other\"} 1\n"));
+        assert!(output.contains("agave_rpc_in_flight{method=\"other\"} 0\n"));
+        assert!(!output.contains("method_"));
+    }
+
+    #[test]
+    fn catalog_cardinality_is_bounded() {
+        assert!(RPC_METHOD_SLOTS <= 128);
+        assert_eq!(RPC_METHOD_SLOTS, RPC_METHOD_LABELS.len());
     }
 }

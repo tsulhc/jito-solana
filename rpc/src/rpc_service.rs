@@ -14,7 +14,7 @@ use {
         snapshot_archive_info::SnapshotArchiveInfoGetter, snapshot_config::SnapshotConfig,
     },
     crossbeam_channel::unbounded,
-    jsonrpc_core::{MetaIoHandler, futures::prelude::*},
+    jsonrpc_core::{Call, MetaIoHandler, futures::prelude::*, middleware::Middleware},
     jsonrpc_http_server::{
         AccessControlAllowOrigin, CloseHandle, DomainsValidation, RequestMiddleware,
         RequestMiddlewareAction, ServerBuilder, hyper,
@@ -64,6 +64,50 @@ use {
         sync::CancellationToken,
     },
 };
+
+#[derive(Clone, Default)]
+struct RpcMetricsMiddleware;
+
+struct RpcInFlightGuard {
+    slot: usize,
+}
+
+impl Drop for RpcInFlightGuard {
+    fn drop(&mut self) {
+        solana_metrics::pull_metrics().finish_rpc_request(self.slot);
+    }
+}
+
+impl Middleware<JsonRpcRequestProcessor> for RpcMetricsMiddleware {
+    type Future = Pin<Box<dyn Future<Output = Option<jsonrpc_core::Response>> + Send>>;
+    type CallFuture = Pin<Box<dyn Future<Output = Option<jsonrpc_core::Output>> + Send>>;
+
+    fn on_call<F, X>(
+        &self,
+        call: Call,
+        meta: JsonRpcRequestProcessor,
+        next: F,
+    ) -> jsonrpc_core::futures::future::Either<Self::CallFuture, X>
+    where
+        F: Fn(Call, JsonRpcRequestProcessor) -> X + Send + Sync,
+        X: Future<Output = Option<jsonrpc_core::Output>> + Send + 'static,
+    {
+        let method = match &call {
+            Call::MethodCall(call) => call.method.as_str(),
+            Call::Notification(call) => call.method.as_str(),
+            Call::Invalid { .. } => "other",
+        };
+        let slot = solana_metrics::pull_metrics::rpc_method_slot(method);
+        solana_metrics::pull_metrics().record_rpc_request(slot);
+        let guard = RpcInFlightGuard { slot };
+        let result = next(call, meta);
+        jsonrpc_core::futures::future::Either::Left(Box::pin(async move {
+            let result = result.await;
+            drop(guard);
+            result
+        }))
+    }
+}
 
 const FULL_SNAPSHOT_REQUEST_PATH: &str = "/snapshot.tar.bz2";
 const INCREMENTAL_SNAPSHOT_REQUEST_PATH: &str = "/incremental-snapshot.tar.bz2";
@@ -714,7 +758,7 @@ impl JsonRpcService {
             .spawn(move || {
                 renice_this_thread(rpc_niceness_adj).unwrap();
 
-                let mut io = MetaIoHandler::default();
+                let mut io = MetaIoHandler::with_middleware(RpcMetricsMiddleware);
 
                 io.extend_with(rpc_minimal::MinimalImpl.to_delegate());
                 if full_api {
