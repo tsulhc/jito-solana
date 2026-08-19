@@ -889,6 +889,7 @@ pub fn execute(
                 // https://github.com/solana-labs/solana/issues/12250
             )
         }),
+        metrics_addr: run_args.metrics_addr,
         pubsub_config: run_args.pub_sub_config,
         voting_disabled,
         wait_for_supermajority: value_t!(matches, "wait_for_supermajority", Slot).ok(),

@@ -20,6 +20,8 @@ use {
     },
     sys_info::{Error, LoadAvg},
 };
+#[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+use solana_metrics::PullMetrics;
 
 const MS_PER_S: u64 = 1_000;
 const MS_PER_M: u64 = MS_PER_S * 60;
@@ -28,9 +30,61 @@ const SAMPLE_INTERVAL_UDP_MS: u64 = 2 * MS_PER_S;
 const SAMPLE_INTERVAL_OS_NETWORK_LIMITS_MS: u64 = MS_PER_H;
 const SAMPLE_INTERVAL_MEM_MS: u64 = 5 * MS_PER_S;
 const SAMPLE_INTERVAL_CPU_MS: u64 = 10 * MS_PER_S;
+const SAMPLE_INTERVAL_JEMALLOC_MS: u64 = 10 * MS_PER_S;
 const SAMPLE_INTERVAL_CPU_ID_MS: u64 = MS_PER_H;
 const SAMPLE_INTERVAL_DISK_MS: u64 = 5 * MS_PER_S;
 const SLEEP_INTERVAL: Duration = Duration::from_millis(500);
+
+#[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JemallocStats {
+    allocated: u64,
+    active: u64,
+    resident: u64,
+    retained: u64,
+}
+
+#[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+trait JemallocStatsReader {
+    fn read(&self) -> Result<JemallocStats, String>;
+}
+
+#[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+struct JemallocCtlReader;
+
+#[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+impl JemallocStatsReader for JemallocCtlReader {
+    fn read(&self) -> Result<JemallocStats, String> {
+        use jemalloc_ctl::{epoch, stats};
+
+        epoch::mib()
+            .map_err(|error| error.to_string())?
+            .advance()
+            .map_err(|error| error.to_string())?;
+        Ok(JemallocStats {
+            allocated: u64::try_from(stats::allocated::mib()
+                .map_err(|error| error.to_string())?
+                .read()
+                .map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?,
+            active: u64::try_from(stats::active::mib()
+                .map_err(|error| error.to_string())?
+                .read()
+                .map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?,
+            resident: u64::try_from(stats::resident::mib()
+                .map_err(|error| error.to_string())?
+                .read()
+                .map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?,
+            retained: u64::try_from(stats::retained::mib()
+                .map_err(|error| error.to_string())?
+                .read()
+                .map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?,
+        })
+    }
+}
 
 #[cfg(target_os = "linux")]
 const PROC_NET_SNMP_PATH: &str = "/proc/net/snmp";
@@ -822,6 +876,19 @@ impl SystemMonitorService {
         }
     }
 
+    #[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+    fn process_jemalloc_stats<R: JemallocStatsReader>(reader: &R, metrics: &PullMetrics) {
+        match reader.read() {
+            Ok(stats) => metrics.store_jemalloc_stats(
+                stats.allocated,
+                stats.active,
+                stats.resident,
+                stats.retained,
+            ),
+            Err(error) => warn!("read jemalloc stats: {error}"),
+        }
+    }
+
     #[cfg(target_os = "linux")]
     fn process_disk_stats(disk_stats: &mut Option<DiskStats>) {
         match read_disk_stats() {
@@ -966,6 +1033,10 @@ impl SystemMonitorService {
         let cpu_timer = AtomicInterval::default();
         let cpuid_timer = AtomicInterval::default();
         let disk_timer = AtomicInterval::default();
+        #[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+        let jemalloc_timer = AtomicInterval::default();
+        #[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+        let jemalloc_reader = JemallocCtlReader;
 
         loop {
             if exit.load(Ordering::Relaxed) {
@@ -994,6 +1065,10 @@ impl SystemMonitorService {
             if config.report_os_disk_stats && disk_timer.should_update(SAMPLE_INTERVAL_DISK_MS) {
                 Self::process_disk_stats(&mut disk_stats);
             }
+            #[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+            if jemalloc_timer.should_update(SAMPLE_INTERVAL_JEMALLOC_MS) {
+                Self::process_jemalloc_stats(&jemalloc_reader, solana_metrics::pull_metrics());
+            }
             sleep(SLEEP_INTERVAL);
         }
     }
@@ -1006,6 +1081,46 @@ impl SystemMonitorService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+    struct MockJemallocReader(Result<JemallocStats, String>);
+
+    #[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+    impl JemallocStatsReader for MockJemallocReader {
+        fn read(&self) -> Result<JemallocStats, String> {
+            self.0.clone()
+        }
+    }
+
+    #[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+    #[test]
+    fn jemalloc_stats_success_updates_all_values() {
+        let metrics = PullMetrics::default();
+        let reader = MockJemallocReader(Ok(JemallocStats {
+            allocated: 11,
+            active: 22,
+            resident: 33,
+            retained: 44,
+        }));
+        SystemMonitorService::process_jemalloc_stats(&reader, &metrics);
+        assert_eq!(metrics.jemalloc_allocated_bytes.load(Ordering::Relaxed), 11);
+        assert_eq!(metrics.jemalloc_active_bytes.load(Ordering::Relaxed), 22);
+        assert_eq!(metrics.jemalloc_resident_bytes.load(Ordering::Relaxed), 33);
+        assert_eq!(metrics.jemalloc_retained_bytes.load(Ordering::Relaxed), 44);
+    }
+
+    #[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+    #[test]
+    fn jemalloc_stats_failure_keeps_last_values() {
+        let metrics = PullMetrics::default();
+        metrics.store_jemalloc_stats(1, 2, 3, 4);
+        let reader = MockJemallocReader(Err("test failure".to_string()));
+        SystemMonitorService::process_jemalloc_stats(&reader, &metrics);
+        assert_eq!(metrics.jemalloc_allocated_bytes.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.jemalloc_active_bytes.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.jemalloc_resident_bytes.load(Ordering::Relaxed), 3);
+        assert_eq!(metrics.jemalloc_retained_bytes.load(Ordering::Relaxed), 4);
+    }
 
     #[test]
     fn test_parse_udp_stats() {
@@ -1110,5 +1225,10 @@ data" as &[u8];
         assert!(SystemMonitorService::calc_percent(99, 100) < 100.0);
         let one_tb_as_kb = (1u64 << 40) >> 10;
         assert!(SystemMonitorService::calc_percent(one_tb_as_kb - 1, one_tb_as_kb) < 100.0);
+    }
+
+    #[test]
+    fn jemalloc_sampling_interval_is_ten_seconds() {
+        assert_eq!(SAMPLE_INTERVAL_JEMALLOC_MS, 10_000);
     }
 }
