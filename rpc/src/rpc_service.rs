@@ -100,9 +100,19 @@ impl Middleware<JsonRpcRequestProcessor> for RpcMetricsMiddleware {
         let slot = solana_metrics::pull_metrics::rpc_method_slot(method);
         solana_metrics::pull_metrics().record_rpc_request(slot);
         let guard = RpcInFlightGuard { slot };
+        let started_at = Instant::now();
         let result = next(call, meta);
         jsonrpc_core::futures::future::Either::Left(Box::pin(async move {
             let result = result.await;
+            let success = result.as_ref().map(|output| match output {
+                jsonrpc_core::Output::Success(_) => true,
+                jsonrpc_core::Output::Failure(_) => false,
+            });
+            solana_metrics::pull_metrics().record_rpc_completion(
+                slot,
+                started_at.elapsed(),
+                success,
+            );
             drop(guard);
             result
         }))
