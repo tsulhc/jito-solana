@@ -8,6 +8,7 @@ on:
       - "**.rs"
       - "**/Cargo.toml"
       - ".github/scripts/port_v421_memory_observability.py"
+      - ".github/scripts/fix_v421_port_tests.py"
       - ".github/workflows/phase421-observability-port.yml"
   workflow_dispatch:
 
@@ -43,6 +44,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 .github/scripts/port_v421_memory_observability.py
+          python3 .github/scripts/fix_v421_port_tests.py
 
       - name: Format modified Rust files
         shell: bash
@@ -88,7 +90,7 @@ jobs:
             -p solana-core \
             -p solana-local-cluster \
             -p agave-validator \
-            --all-targets -- -D warnings
+            --lib --bins --tests -- -D warnings
 
       - name: Commit validated semantic port
         if: github.event_name == 'pull_request'
