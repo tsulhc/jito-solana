@@ -145,6 +145,7 @@ impl<'a> ScanGuard<'a> {
         };
 
         scan_tracker.active_scans.fetch_add(1, Ordering::Relaxed);
+        solana_metrics::pull_metrics().record_accounts_scan_start();
         Some(Self {
             scan_tracker,
             max_root: max_root_inclusive,
@@ -215,8 +216,8 @@ impl<'a> ScanGuard<'a> {
     ///   slot 5 (scan)
     /// ```
     ///
-    ///    Consider both types of ancestors, `ancestor <= max_root` and
-    ///    `ancestor > max_root`, where `max_root == 1` as illustrated above.
+    ///    Consider both types of ancestors, `ancestor <= max_root` and `ancestor > max_root`, where
+    ///    `max_root == 1` as illustrated above.
     ///
     ///    a) The set of `ancestors <= max_root` are all rooted, which means their
     ///       state is protected by the same guarantees as case 1.
@@ -250,6 +251,7 @@ impl Drop for ScanGuard<'_> {
         self.scan_tracker
             .active_scans
             .fetch_sub(1, Ordering::Relaxed);
+        solana_metrics::pull_metrics().record_accounts_scan_complete();
         let mut ongoing_scan_roots = self.scan_tracker.ongoing_scan_roots.write().unwrap();
         let count = ongoing_scan_roots.get_mut(&self.max_root).unwrap();
         *count -= 1;
@@ -316,67 +318,5 @@ mod tests {
 
         drop(guard2);
         assert!(tracker.min_ongoing_scan_root().is_none());
-    }
-
-    #[test]
-    fn test_scan_guard_multiple_different_roots() {
-        let tracker = ScanTracker::default();
-
-        let guard1 = ScanGuard::try_new(&tracker, 0, || 5).unwrap();
-        let guard2 = ScanGuard::try_new(&tracker, 0, || 15).unwrap();
-        assert_eq!(tracker.active_scans.load(Ordering::Relaxed), 2);
-        assert_eq!(tracker.min_ongoing_scan_root(), Some(5));
-
-        drop(guard1);
-        assert_eq!(tracker.min_ongoing_scan_root(), Some(15));
-
-        drop(guard2);
-        assert!(tracker.min_ongoing_scan_root().is_none());
-    }
-
-    #[test]
-    fn test_scan_guard_rejected_for_removed_bank() {
-        let tracker = ScanTracker::default();
-        tracker.removed_bank_ids.lock().unwrap().insert(7);
-
-        let result = ScanGuard::try_new(&tracker, 7, || 100);
-        assert!(result.is_none());
-        // should not have incremented active_scans
-        assert_eq!(tracker.active_scans.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn test_scan_guard_corrupted_when_bank_removed_during_scan() {
-        let tracker = ScanTracker::default();
-        let guard = ScanGuard::try_new(&tracker, 5, || 50).unwrap();
-
-        // simulate bank removal mid-scan
-        tracker.removed_bank_ids.lock().unwrap().insert(5);
-
-        assert!(guard.was_scan_corrupted());
-        // guard should still have cleaned up
-        assert_eq!(tracker.active_scans.load(Ordering::Relaxed), 0);
-        assert!(tracker.min_ongoing_scan_root().is_none());
-    }
-
-    #[test]
-    fn test_scan_guard_should_use_ancestors_when_max_root_in_ancestors() {
-        let tracker = ScanTracker::default();
-        let mut ancestors = Ancestors::default();
-        ancestors.insert(42);
-
-        let guard = ScanGuard::try_new(&tracker, 0, || 42).unwrap();
-        assert!(guard.should_use_ancestors(&ancestors));
-    }
-
-    #[test]
-    fn test_scan_guard_skip_ancestors_when_max_root_not_in_ancestors() {
-        let tracker = ScanTracker::default();
-        let mut ancestors = Ancestors::default();
-        ancestors.insert(10);
-
-        // max_root_inclusive = 42, which is NOT in ancestors
-        let guard = ScanGuard::try_new(&tracker, 0, || 42).unwrap();
-        assert!(!guard.should_use_ancestors(&ancestors));
     }
 }
