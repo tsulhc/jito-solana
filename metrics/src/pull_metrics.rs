@@ -1,6 +1,6 @@
 //! Lock-free, pull-oriented metrics used by the validator's private metrics route.
 //!
-//! Updates only touch numeric atomics.  The Prometheus-compatible text is built by
+//! Updates only touch numeric atomics. The Prometheus-compatible text is built by
 //! [`PullMetrics::exposition`] when a scrape is requested.
 
 use std::{
@@ -28,24 +28,6 @@ const RPC_METHOD_LABELS: [&str; RPC_METHOD_SLOTS] = [
     "getRecentPrioritizationFees", "other",
 ];
 
-const ACCOUNT_SCAN_KIND_SLOTS: usize = 2;
-const ACCOUNT_SCAN_KIND_LABELS: [&str; ACCOUNT_SCAN_KIND_SLOTS] = ["full", "indexed"];
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AccountScanKind {
-    Full,
-    Indexed,
-}
-
-impl AccountScanKind {
-    fn slot(self) -> usize {
-        match self {
-            Self::Full => 0,
-            Self::Indexed => 1,
-        }
-    }
-}
-
 pub fn rpc_method_slot(method: &str) -> usize {
     RPC_METHOD_LABELS[..RPC_METHOD_SLOTS - 1]
         .iter()
@@ -64,8 +46,6 @@ pub struct PullMetrics {
     accounts_scan_active_live: AtomicU64,
     accounts_scan_started_total: AtomicU64,
     accounts_scan_completed_total: AtomicU64,
-    account_scans: [AtomicU64; ACCOUNT_SCAN_KIND_SLOTS],
-    account_scan_accounts_returned: [AtomicU64; ACCOUNT_SCAN_KIND_SLOTS],
     pub accounts_scan_max_root_distance: AtomicU64,
     pub jemalloc_allocated_bytes: AtomicU64,
     pub jemalloc_resident_bytes: AtomicU64,
@@ -88,8 +68,6 @@ impl Default for PullMetrics {
             accounts_scan_active_live: AtomicU64::new(0),
             accounts_scan_started_total: AtomicU64::new(0),
             accounts_scan_completed_total: AtomicU64::new(0),
-            account_scans: std::array::from_fn(|_| AtomicU64::new(0)),
-            account_scan_accounts_returned: std::array::from_fn(|_| AtomicU64::new(0)),
             accounts_scan_max_root_distance: AtomicU64::new(0),
             jemalloc_allocated_bytes: AtomicU64::new(0),
             jemalloc_resident_bytes: AtomicU64::new(0),
@@ -120,22 +98,6 @@ impl PullMetrics {
         );
         self.accounts_scan_completed_total
             .fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_account_scan(&self, kind: AccountScanKind) {
-        self.account_scans[kind.slot()].fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_account_scan_accounts_returned(
-        &self,
-        kind: AccountScanKind,
-        accounts_returned: usize,
-    ) {
-        let accounts_returned = u64::try_from(accounts_returned).unwrap_or(u64::MAX);
-        let counter = &self.account_scan_accounts_returned[kind.slot()];
-        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            Some(value.saturating_add(accounts_returned))
-        });
     }
 
     pub fn record_rpc_request(&self, slot: usize) {
@@ -222,26 +184,6 @@ impl PullMetrics {
             "agave_accounts_scan_completed_total",
             self.accounts_scan_completed_total
         );
-        for (kind_slot, kind_label) in ACCOUNT_SCAN_KIND_LABELS.iter().enumerate() {
-            output.push_str("agave_accounts_scans_total{kind=\"");
-            output.push_str(kind_label);
-            output.push_str("\"} ");
-            output.push_str(
-                &self.account_scans[kind_slot]
-                    .load(Ordering::Relaxed)
-                    .to_string(),
-            );
-            output.push('\n');
-            output.push_str("agave_accounts_scan_accounts_returned_total{kind=\"");
-            output.push_str(kind_label);
-            output.push_str("\"} ");
-            output.push_str(
-                &self.account_scan_accounts_returned[kind_slot]
-                    .load(Ordering::Relaxed)
-                    .to_string(),
-            );
-            output.push('\n');
-        }
         gauge!(
             "agave_accounts_scan_max_root_distance",
             self.accounts_scan_max_root_distance
@@ -323,8 +265,6 @@ mod tests {
             .store(168, Ordering::Relaxed);
         metrics.accounts_scan_active.store(99, Ordering::Relaxed);
         metrics.record_accounts_scan_start();
-        metrics.record_account_scan(AccountScanKind::Indexed);
-        metrics.record_account_scan_accounts_returned(AccountScanKind::Indexed, 12);
         metrics
             .accounts_scan_max_root_distance
             .store(7, Ordering::Relaxed);
@@ -338,10 +278,6 @@ mod tests {
         assert!(output.contains("agave_accounts_scan_active 1\n"));
         assert!(output.contains("agave_accounts_scan_started_total 1\n"));
         assert!(output.contains("agave_accounts_scan_completed_total 0\n"));
-        assert!(output.contains("agave_accounts_scans_total{kind=\"indexed\"} 1\n"));
-        assert!(output.contains(
-            "agave_accounts_scan_accounts_returned_total{kind=\"indexed\"} 12\n"
-        ));
         assert!(output.contains("agave_accounts_scan_max_root_distance 7\n"));
         assert!(output.contains("agave_jemalloc_allocated_bytes 10\n"));
         assert!(output.contains("agave_jemalloc_active_bytes 20\n"));
@@ -405,23 +341,6 @@ mod tests {
     }
 
     #[test]
-    fn account_scan_kind_and_results_are_bounded() {
-        let metrics = PullMetrics::default();
-        metrics.record_account_scan(AccountScanKind::Full);
-        metrics.record_account_scan(AccountScanKind::Full);
-        metrics.record_account_scan_accounts_returned(AccountScanKind::Full, 2);
-        metrics.record_account_scan_accounts_returned(AccountScanKind::Full, 3);
-        metrics.record_account_scan(AccountScanKind::Indexed);
-        metrics.record_account_scan_accounts_returned(AccountScanKind::Indexed, 7);
-        let output = metrics.exposition();
-        assert!(output.contains("agave_accounts_scans_total{kind=\"full\"} 2\n"));
-        assert!(output.contains(
-            "agave_accounts_scan_accounts_returned_total{kind=\"full\"} 5\n"
-        ));
-        assert!(output.contains("agave_accounts_scans_total{kind=\"indexed\"} 1\n"));
-    }
-
-    #[test]
     fn unknown_methods_use_the_bounded_other_slot() {
         let metrics = PullMetrics::default();
         let slot = rpc_method_slot("notRegistered");
@@ -451,6 +370,5 @@ mod tests {
     fn catalog_cardinality_is_bounded() {
         assert!(RPC_METHOD_SLOTS <= 128);
         assert_eq!(RPC_METHOD_SLOTS, RPC_METHOD_LABELS.len());
-        assert_eq!(ACCOUNT_SCAN_KIND_SLOTS, ACCOUNT_SCAN_KIND_LABELS.len());
     }
 }
