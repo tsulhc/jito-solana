@@ -97,4 +97,4 @@ impl Drop for TokenCounter {
     }
 }
 
-// Temporary CI trigger for the final v4.2.1 validation gate; remove before merge.
+// Temporary CI trigger for the release-with-LTO rerun; remove before merge.
