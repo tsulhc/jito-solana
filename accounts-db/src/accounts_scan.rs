@@ -145,6 +145,7 @@ impl<'a> ScanGuard<'a> {
         };
 
         scan_tracker.active_scans.fetch_add(1, Ordering::Relaxed);
+        solana_metrics::pull_metrics().record_accounts_scan_start();
         Some(Self {
             scan_tracker,
             max_root: max_root_inclusive,
@@ -250,6 +251,7 @@ impl Drop for ScanGuard<'_> {
         self.scan_tracker
             .active_scans
             .fetch_sub(1, Ordering::Relaxed);
+        solana_metrics::pull_metrics().record_accounts_scan_complete();
         let mut ongoing_scan_roots = self.scan_tracker.ongoing_scan_roots.write().unwrap();
         let count = ongoing_scan_roots.get_mut(&self.max_root).unwrap();
         *count -= 1;
