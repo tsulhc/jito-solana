@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - kleomedes/v4.1.2-memory-observability-1.1
+  pull_request:
+    branches:
+      - v4.1.2-jito
   workflow_dispatch:
 
 permissions:
