@@ -96,5 +96,3 @@ impl Drop for TokenCounter {
         );
     }
 }
-
-// Temporary CI trigger for the release-with-LTO rerun; remove before merge.
