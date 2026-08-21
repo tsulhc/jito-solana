@@ -6,7 +6,7 @@ use {
     },
     agave_snapshots::{SUPPORTED_ARCHIVE_COMPRESSION, SnapshotVersion},
     bytesize::ByteSize,
-    clap::{App, Arg, ArgMatches, values_t},
+    clap::{App, Arg, ArgMatches, value_t, values_t},
     solana_accounts_db::utils::create_and_canonicalize_directory,
     solana_clap_utils::{
         hidden_unless_forced,
@@ -59,6 +59,7 @@ pub struct RunArgs {
     pub pub_sub_config: PubSubConfig,
     pub send_transaction_service_config: SendTransactionServiceConfig,
     pub filter_keys: HashSet<Pubkey>,
+    pub metrics_addr: Option<SocketAddr>,
 }
 
 impl FromClapArgMatches for RunArgs {
@@ -138,6 +139,11 @@ impl FromClapArgMatches for RunArgs {
                     .collect()
             } else {
                 HashSet::new()
+            },
+            metrics_addr: if matches.is_present("metrics_bind_address") {
+                Some(value_t!(matches, "metrics_bind_address", SocketAddr)?)
+            } else {
+                None
             },
         })
     }
@@ -243,6 +249,24 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a, 
             .long("private-rpc")
             .takes_value(false)
             .help("Do not publish the RPC port for use by others"),
+    )
+    .arg(
+        Arg::with_name("metrics_bind_address")
+            .long("metrics-bind-address")
+            .value_name("HOST:PORT")
+            .takes_value(true)
+            .validator(|value| {
+                value
+                    .parse::<SocketAddr>()
+                    .map(|_| ())
+                    .map_err(|err| format!("invalid metrics bind address: {err}"))
+            })
+            .requires("rpc_port")
+            .help(
+                "Enable the Prometheus metrics listener on the given HOST:PORT. The listener \
+                 has no authentication and must only be bound to loopback or other private, \
+                 trusted interfaces.",
+            ),
     )
     .arg(
         Arg::with_name("no_port_check")
@@ -1457,6 +1481,7 @@ mod tests {
                 },
                 send_transaction_service_config: SendTransactionServiceConfig::default(),
                 filter_keys: HashSet::new(),
+                metrics_addr: None,
             }
         }
     }
@@ -1476,6 +1501,7 @@ mod tests {
                 pub_sub_config: self.pub_sub_config.clone(),
                 send_transaction_service_config: self.send_transaction_service_config.clone(),
                 filter_keys: self.filter_keys.clone(),
+                metrics_addr: self.metrics_addr,
             }
         }
     }
