@@ -125,11 +125,11 @@ impl PullMetrics {
     }
 
     pub fn record_accounts_scan_complete(&self) {
-        let _ = self.accounts_scan_active.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |value| value.checked_sub(1),
-        );
+        let _ =
+            self.accounts_scan_active
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    value.checked_sub(1)
+                });
         self.accounts_scan_completed_total
             .fetch_add(1, Ordering::Relaxed);
     }
@@ -180,8 +180,10 @@ impl PullMetrics {
         self.jemalloc_allocated_bytes
             .store(allocated, Ordering::Relaxed);
         self.jemalloc_active_bytes.store(active, Ordering::Relaxed);
-        self.jemalloc_resident_bytes.store(resident, Ordering::Relaxed);
-        self.jemalloc_retained_bytes.store(retained, Ordering::Relaxed);
+        self.jemalloc_resident_bytes
+            .store(resident, Ordering::Relaxed);
+        self.jemalloc_retained_bytes
+            .store(retained, Ordering::Relaxed);
     }
 
     fn push_micros_as_seconds(output: &mut String, micros: u64) {
@@ -322,9 +324,10 @@ mod tests {
         assert!(output.contains(
             "agave_rpc_responses_total{method=\"getProgramAccounts\",outcome=\"error\"} 1\n"
         ));
-        assert!(output.contains(
-            "agave_rpc_duration_seconds_total{method=\"getProgramAccounts\"} 1.5\n"
-        ));
+        assert!(
+            output
+                .contains("agave_rpc_duration_seconds_total{method=\"getProgramAccounts\"} 1.5\n")
+        );
         assert!(output.contains("agave_rpc_in_flight{method=\"getProgramAccounts\"} 0\n"));
     }
 

@@ -223,6 +223,13 @@ impl Stats {
 
         let count_in_mem = self.count_in_mem.load(Ordering::Relaxed);
         let capacity_in_mem = self.capacity_in_mem.load(Ordering::Relaxed);
+        let pull_metrics = solana_metrics::pull_metrics();
+        pull_metrics
+            .accounts_index_count_in_mem
+            .store(count_in_mem as u64, Ordering::Relaxed);
+        pull_metrics
+            .accounts_index_capacity_in_mem
+            .store(capacity_in_mem as u64, Ordering::Relaxed);
 
         // sum of elapsed time in each thread
         let thread_time_elapsed_ms = elapsed_ms * storage.threads as u64;
@@ -282,6 +289,9 @@ impl Stats {
                 + (held_in_mem_ref_count + held_in_mem_slot_list_len) as usize
                     * size_of::<SlotListItem<T>>() // <-- size of one slot list entry
                     * 2; // <-- and assume there are two entries
+            pull_metrics
+                .accounts_index_estimate_mem_bytes
+                .store(estimate_mem_bytes as u64, Ordering::Relaxed);
             datapoint_info!(
                 datapoint_name,
                 ("estimate_mem_bytes", estimate_mem_bytes, i64),
@@ -598,19 +608,18 @@ impl Stats {
                 ),
             );
         } else {
+            let estimate_mem_bytes =
+                // hash map mem usage is based on capacity, and the footprint of a KV-pair
+                // (we ignore other hash map details, such as load factor)
+                capacity_in_mem * InMemAccountsIndex::<T, U>::size_of_uninitialized()
+                // each value in use we assume has a single entry in the slot list
+                + count_in_mem * InMemAccountsIndex::<T, U>::size_of_single_entry();
+            pull_metrics
+                .accounts_index_estimate_mem_bytes
+                .store(estimate_mem_bytes as u64, Ordering::Relaxed);
             datapoint_info!(
                 datapoint_name,
-                (
-                    "estimate_mem_bytes",
-                    (
-                        // hash map mem usage is based on capacity, and the footprint of a KV-pair
-                        // (we ignore other hash map details, such as load factor)
-                        capacity_in_mem * InMemAccountsIndex::<T, U>::size_of_uninitialized()
-                        // each value in use we assume has a single entry in the slot list
-                        + count_in_mem * InMemAccountsIndex::<T, U>::size_of_single_entry()
-                    ),
-                    i64
-                ),
+                ("estimate_mem_bytes", estimate_mem_bytes, i64),
                 ("count_in_mem", count_in_mem, i64),
                 ("capacity_in_mem", capacity_in_mem, i64),
                 ("count", self.total_count(), i64),

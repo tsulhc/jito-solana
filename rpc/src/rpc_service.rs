@@ -14,7 +14,7 @@ use {
         snapshot_archive_info::SnapshotArchiveInfoGetter, snapshot_config::SnapshotConfig,
     },
     crossbeam_channel::unbounded,
-    jsonrpc_core::{MetaIoHandler, futures::prelude::*},
+    jsonrpc_core::{Call, MetaIoHandler, futures::prelude::*, middleware::Middleware},
     jsonrpc_http_server::{
         AccessControlAllowOrigin, CloseHandle, DomainsValidation, RequestMiddleware,
         RequestMiddlewareAction, ServerBuilder, hyper,
@@ -65,6 +65,60 @@ use {
     },
 };
 
+#[derive(Clone, Default)]
+struct RpcMetricsMiddleware;
+
+struct RpcInFlightGuard {
+    slot: usize,
+}
+
+impl Drop for RpcInFlightGuard {
+    fn drop(&mut self) {
+        solana_metrics::pull_metrics().finish_rpc_request(self.slot);
+    }
+}
+
+impl Middleware<JsonRpcRequestProcessor> for RpcMetricsMiddleware {
+    type Future = Pin<Box<dyn Future<Output = Option<jsonrpc_core::Response>> + Send>>;
+    type CallFuture = Pin<Box<dyn Future<Output = Option<jsonrpc_core::Output>> + Send>>;
+
+    fn on_call<F, X>(
+        &self,
+        call: Call,
+        meta: JsonRpcRequestProcessor,
+        next: F,
+    ) -> jsonrpc_core::futures::future::Either<Self::CallFuture, X>
+    where
+        F: Fn(Call, JsonRpcRequestProcessor) -> X + Send + Sync,
+        X: Future<Output = Option<jsonrpc_core::Output>> + Send + 'static,
+    {
+        let method = match &call {
+            Call::MethodCall(call) => call.method.as_str(),
+            Call::Notification(call) => call.method.as_str(),
+            Call::Invalid { .. } => "other",
+        };
+        let slot = solana_metrics::pull_metrics::rpc_method_slot(method);
+        solana_metrics::pull_metrics().record_rpc_request(slot);
+        let guard = RpcInFlightGuard { slot };
+        let started_at = Instant::now();
+        let result = next(call, meta);
+        jsonrpc_core::futures::future::Either::Left(Box::pin(async move {
+            let result = result.await;
+            let success = result.as_ref().map(|output| match output {
+                jsonrpc_core::Output::Success(_) => true,
+                jsonrpc_core::Output::Failure(_) => false,
+            });
+            solana_metrics::pull_metrics().record_rpc_completion(
+                slot,
+                started_at.elapsed(),
+                success,
+            );
+            drop(guard);
+            result
+        }))
+    }
+}
+
 const FULL_SNAPSHOT_REQUEST_PATH: &str = "/snapshot.tar.bz2";
 const INCREMENTAL_SNAPSHOT_REQUEST_PATH: &str = "/incremental-snapshot.tar.bz2";
 const LARGEST_ACCOUNTS_CACHE_DURATION: u64 = 60 * 60 * 2;
@@ -113,11 +167,13 @@ where
 
 pub struct JsonRpcService {
     thread_hdl: JoinHandle<()>,
+    metrics_thread_hdl: Option<JoinHandle<()>>,
 
     #[cfg(test)]
     pub request_processor: JsonRpcRequestProcessor, // Used only by test_rpc_new()...
 
     close_handle: Option<CloseHandle>,
+    metrics_close_handle: Option<CloseHandle>,
 
     client_updater: Arc<dyn NotifyKeyUpdate + Send + Sync>,
 }
@@ -406,6 +462,92 @@ impl RequestMiddleware for RpcRequestMiddleware {
     }
 }
 
+struct MetricsRequestMiddleware;
+
+#[cfg(not(any(target_env = "msvc", target_os = "freebsd")))]
+fn refresh_jemalloc_metrics() -> Result<(), String> {
+    use jemalloc_ctl::{epoch, stats};
+
+    epoch::mib()
+        .map_err(|error| error.to_string())?
+        .advance()
+        .map_err(|error| error.to_string())?;
+    let allocated = u64::try_from(
+        stats::allocated::mib()
+            .map_err(|error| error.to_string())?
+            .read()
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let active = u64::try_from(
+        stats::active::mib()
+            .map_err(|error| error.to_string())?
+            .read()
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let resident = u64::try_from(
+        stats::resident::mib()
+            .map_err(|error| error.to_string())?
+            .read()
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let retained = u64::try_from(
+        stats::retained::mib()
+            .map_err(|error| error.to_string())?
+            .read()
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    solana_metrics::pull_metrics().store_jemalloc_stats(allocated, active, resident, retained);
+    Ok(())
+}
+
+#[cfg(any(target_env = "msvc", target_os = "freebsd"))]
+fn refresh_jemalloc_metrics() -> Result<(), String> {
+    Ok(())
+}
+
+impl MetricsRequestMiddleware {
+    fn response(status: hyper::StatusCode) -> RequestMiddlewareAction {
+        RequestMiddlewareAction::Respond {
+            should_validate_hosts: false,
+            response: Box::pin(async move {
+                Ok(hyper::Response::builder()
+                    .status(status)
+                    .body(hyper::Body::empty())
+                    .unwrap())
+            }),
+        }
+    }
+}
+
+impl RequestMiddleware for MetricsRequestMiddleware {
+    fn on_request(&self, request: hyper::Request<hyper::Body>) -> RequestMiddlewareAction {
+        if request.method() == hyper::Method::GET && request.uri().path() == "/metrics" {
+            RequestMiddlewareAction::Respond {
+                should_validate_hosts: false,
+                response: Box::pin(async {
+                    if let Err(error) = refresh_jemalloc_metrics() {
+                        warn!("read jemalloc stats: {error}");
+                    }
+                    Ok(hyper::Response::builder()
+                        .status(hyper::StatusCode::OK)
+                        .header(hyper::header::CONTENT_TYPE, "text/plain; version=0.0.4")
+                        .header(hyper::header::CACHE_CONTROL, "no-store")
+                        .body(hyper::Body::from(solana_metrics::pull_metrics_exposition()))
+                        .unwrap())
+                }),
+            }
+        } else if request.uri().path() == "/metrics" {
+            Self::response(hyper::StatusCode::METHOD_NOT_ALLOWED)
+        } else {
+            Self::response(hyper::StatusCode::NOT_FOUND)
+        }
+    }
+}
+
 fn match_supply_path(path: &str) -> Option<&str> {
     match path {
         "/v0/circulating-supply" | "/v0/total-supply" => Some(path),
@@ -472,6 +614,7 @@ fn process_rest(bank_forks: Arc<RwLock<BankForks>>, path: &str) -> RequestMiddle
 /// `client_option`.
 pub struct JsonRpcServiceConfig<'a> {
     pub rpc_addr: SocketAddr,
+    pub metrics_addr: Option<SocketAddr>,
     pub rpc_config: JsonRpcConfig,
     pub snapshot_config: Option<SnapshotConfig>,
     pub bank_forks: Arc<RwLock<BankForks>>,
@@ -534,6 +677,7 @@ impl JsonRpcService {
 
         let json_rpc_service = Self::new(
             config.rpc_addr,
+            config.metrics_addr,
             config.rpc_config.clone(),
             config.snapshot_config,
             config.bank_forks.clone(),
@@ -567,6 +711,7 @@ impl JsonRpcService {
             + 'static,
     >(
         rpc_addr: SocketAddr,
+        metrics_addr: Option<SocketAddr>,
         config: JsonRpcConfig,
         snapshot_config: Option<SnapshotConfig>,
         bank_forks: Arc<RwLock<BankForks>>,
@@ -698,7 +843,7 @@ impl JsonRpcService {
             .spawn(move || {
                 renice_this_thread(rpc_niceness_adj).unwrap();
 
-                let mut io = MetaIoHandler::default();
+                let mut io = MetaIoHandler::with_middleware(RpcMetricsMiddleware);
 
                 io.extend_with(rpc_minimal::MinimalImpl.to_delegate());
                 if full_api {
@@ -753,18 +898,56 @@ impl JsonRpcService {
             .unwrap();
 
         let close_handle = close_handle_receiver.recv().unwrap()?;
+        let (metrics_thread_hdl, metrics_close_handle) = if let Some(metrics_addr) = metrics_addr {
+            let (sender, receiver) = unbounded();
+            let metrics_thread_hdl = Builder::new()
+                .name("solMetricsSvc".to_string())
+                .spawn(move || {
+                    let server = ServerBuilder::<()>::new(MetaIoHandler::default())
+                        .threads(1)
+                        .request_middleware(MetricsRequestMiddleware)
+                        .start_http(&metrics_addr);
+                    match server {
+                        Ok(server) => {
+                            sender.send(Ok(server.close_handle())).unwrap();
+                            server.wait();
+                        }
+                        Err(error) => {
+                            sender.send(Err(error.to_string())).unwrap();
+                        }
+                    }
+                })
+                .unwrap();
+            match receiver.recv().unwrap() {
+                Ok(close_handle) => (Some(metrics_thread_hdl), Some(close_handle)),
+                Err(error) => {
+                    close_handle.clone().close();
+                    metrics_thread_hdl.join().unwrap();
+                    thread_hdl.join().unwrap();
+                    return Err(error);
+                }
+            }
+        } else {
+            (None, None)
+        };
         let close_handle_ = close_handle.clone();
+        let metrics_close_handle_ = metrics_close_handle.clone();
         validator_exit
             .write()
             .unwrap()
             .register_exit(Box::new(move || {
                 close_handle_.close();
+                if let Some(close_handle) = &metrics_close_handle_ {
+                    close_handle.clone().close();
+                }
             }));
         Ok(Self {
             thread_hdl,
+            metrics_thread_hdl,
             #[cfg(test)]
             request_processor: test_request_processor,
             close_handle: Some(close_handle),
+            metrics_close_handle,
             client_updater: Arc::new(client) as Arc<dyn NotifyKeyUpdate + Send + Sync>,
         })
     }
@@ -773,11 +956,18 @@ impl JsonRpcService {
         if let Some(c) = self.close_handle.take() {
             c.close()
         }
+        if let Some(c) = self.metrics_close_handle.take() {
+            c.close()
+        }
     }
 
     pub fn join(mut self) -> thread::Result<()> {
         self.exit();
-        self.thread_hdl.join()
+        self.thread_hdl.join()?;
+        if let Some(thread_hdl) = self.metrics_thread_hdl {
+            thread_hdl.join()?;
+        }
+        Ok(())
     }
 
     pub fn get_client_key_updater(&self) -> Arc<dyn NotifyKeyUpdate + Send + Sync> {
@@ -885,6 +1075,7 @@ mod tests {
         );
         let mut rpc_service = JsonRpcService::new(
             rpc_addr,
+            None,
             json_rpc_config,
             None,
             bank_forks,
@@ -919,6 +1110,70 @@ mod tests {
         );
         rpc_service.exit();
         rpc_service.join().unwrap();
+    }
+
+    #[test]
+    fn test_json_rpc_listener_does_not_serve_metrics() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
+        let bank_forks = create_bank_forks();
+        let optimistically_confirmed_bank =
+            OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
+        let middleware = RpcRequestMiddleware::new(
+            ledger_path.path().to_path_buf(),
+            None,
+            bank_forks,
+            RpcHealth::stub(optimistically_confirmed_bank, blockstore),
+        );
+        let request = hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri("/metrics")
+            .body(hyper::Body::empty())
+            .unwrap();
+        assert!(matches!(
+            middleware.on_request(request),
+            RequestMiddlewareAction::Proceed { .. }
+        ));
+    }
+
+    #[test]
+    fn test_metrics_listener_serves_only_get_metrics() {
+        let runtime = Runtime::new().unwrap();
+        let middleware = MetricsRequestMiddleware;
+        let get = hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri("/metrics")
+            .body(hyper::Body::empty())
+            .unwrap();
+        let response = match middleware.on_request(get) {
+            RequestMiddlewareAction::Respond { response, .. } => {
+                runtime.block_on(response).unwrap()
+            }
+            RequestMiddlewareAction::Proceed { .. } => panic!("metrics request proceeded"),
+        };
+        assert_eq!(response.status(), hyper::StatusCode::OK);
+
+        for (method, path, status) in [
+            (
+                hyper::Method::POST,
+                "/metrics",
+                hyper::StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (hyper::Method::GET, "/", hyper::StatusCode::NOT_FOUND),
+        ] {
+            let request = hyper::Request::builder()
+                .method(method)
+                .uri(path)
+                .body(hyper::Body::empty())
+                .unwrap();
+            let response = match middleware.on_request(request) {
+                RequestMiddlewareAction::Respond { response, .. } => {
+                    runtime.block_on(response).unwrap()
+                }
+                RequestMiddlewareAction::Proceed { .. } => panic!("metrics request proceeded"),
+            };
+            assert_eq!(response.status(), status);
+        }
     }
 
     fn create_bank_forks() -> Arc<RwLock<BankForks>> {
