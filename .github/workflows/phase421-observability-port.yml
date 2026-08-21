@@ -13,15 +13,14 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  port-and-validate:
+  validate:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          ref: ${{ github.head_ref }}
           submodules: recursive
           fetch-depth: 0
 
@@ -39,18 +38,17 @@ jobs:
           echo "RUST_STABLE=$rust_stable" >> "$GITHUB_ENV"
           rustup component add rustfmt clippy --toolchain "$rust_stable"
 
-      - name: Apply exact-context semantic port
+      - name: Verify exact release ancestry
         shell: bash
         run: |
           set -euo pipefail
-          python3 .github/scripts/port_v421_memory_observability.py
-          python3 .github/scripts/fix_v421_port_tests.py
+          git merge-base --is-ancestor 166de6d3a5082ce1abbe04dd42077fa75cac877e HEAD
 
-      - name: Format modified Rust files
+      - name: Verify formatting
         shell: bash
         run: |
           set -euo pipefail
-          rustfmt +"$RUST_STABLE" --edition 2024 \
+          rustfmt +"$RUST_STABLE" --edition 2024 --check \
             metrics/src/lib.rs \
             metrics/src/pull_metrics.rs \
             accounts-db/src/accounts_scan.rs \
@@ -92,27 +90,12 @@ jobs:
             -p agave-validator \
             --lib --bins --tests -- -D warnings
 
-      - name: Commit validated semantic port
-        if: github.event_name == 'pull_request'
+      - name: Production-like release-with-lto validator build
         shell: bash
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -- \
-            metrics/src/lib.rs \
-            metrics/src/pull_metrics.rs \
-            accounts-db/src/accounts_scan.rs \
-            accounts-db/src/accounts_index/stats.rs \
-            rpc/Cargo.toml \
-            rpc/src/rpc_service.rs \
-            core/src/validator.rs \
-            local-cluster/src/validator_configs.rs \
-            validator/src/commands/run/args.rs \
-            validator/src/commands/run/execute.rs
-          if git diff --cached --quiet; then
-            echo "No validated port changes to commit"
-            exit 0
-          fi
-          git commit -m "v4.2.1: port memory observability"
-          git push origin HEAD:${{ github.head_ref }}
+          export CI_COMMIT="$(git rev-parse HEAD)"
+          scripts/cargo-install-all.sh --release-with-lto --validator-only /tmp/agave-v421-observability
+          test -x /tmp/agave-v421-observability/bin/agave-validator
+          /tmp/agave-v421-observability/bin/agave-validator --version
+          sha256sum /tmp/agave-v421-observability/bin/agave-validator
