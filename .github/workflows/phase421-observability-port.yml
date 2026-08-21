@@ -21,6 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
+          ref: ${{ github.head_ref || github.sha }}
           submodules: recursive
           fetch-depth: 0
 
@@ -89,6 +90,13 @@ jobs:
             -p solana-local-cluster \
             -p agave-validator \
             --lib --bins --tests -- -D warnings
+
+      - name: Install release build dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev
 
       - name: Production-like release-with-lto validator build
         shell: bash
