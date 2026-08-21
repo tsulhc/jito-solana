@@ -3,11 +3,9 @@
 //! Updates only touch numeric atomics.  The Prometheus-compatible text is built by
 //! [`PullMetrics::exposition`] when a scrape is requested.
 
-use {
-    std::{
-        sync::atomic::{AtomicU64, Ordering},
-        time::Duration,
-    },
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 
 /// The number of method slots reserved for RPC instrumentation.
@@ -59,13 +57,15 @@ pub struct PullMetrics {
     pub accounts_index_count_in_mem: AtomicU64,
     pub accounts_index_capacity_in_mem: AtomicU64,
     pub accounts_index_estimate_mem_bytes: AtomicU64,
-    /// Legacy sampled value written by `clean_accounts`.  Phase 1.1 exports
+    /// Legacy sampled value written by `clean_accounts`. Phase 1.1 exports
     /// `accounts_scan_active_live` instead so clean sampling cannot race with
     /// ScanGuard lifecycle updates.
     pub accounts_scan_active: AtomicU64,
     accounts_scan_active_live: AtomicU64,
     accounts_scan_started_total: AtomicU64,
     accounts_scan_completed_total: AtomicU64,
+    account_scans: [AtomicU64; ACCOUNT_SCAN_KIND_SLOTS],
+    account_scan_accounts_returned: [AtomicU64; ACCOUNT_SCAN_KIND_SLOTS],
     pub accounts_scan_max_root_distance: AtomicU64,
     pub jemalloc_allocated_bytes: AtomicU64,
     pub jemalloc_resident_bytes: AtomicU64,
@@ -76,9 +76,6 @@ pub struct PullMetrics {
     rpc_responses_error: [AtomicU64; RPC_METHOD_SLOTS],
     rpc_duration_micros: [AtomicU64; RPC_METHOD_SLOTS],
     rpc_in_flight_by_method: [AtomicU64; RPC_METHOD_SLOTS],
-    rpc_account_scans: [[AtomicU64; ACCOUNT_SCAN_KIND_SLOTS]; RPC_METHOD_SLOTS],
-    rpc_account_scan_accounts_returned:
-        [[AtomicU64; ACCOUNT_SCAN_KIND_SLOTS]; RPC_METHOD_SLOTS],
 }
 
 impl Default for PullMetrics {
@@ -91,6 +88,8 @@ impl Default for PullMetrics {
             accounts_scan_active_live: AtomicU64::new(0),
             accounts_scan_started_total: AtomicU64::new(0),
             accounts_scan_completed_total: AtomicU64::new(0),
+            account_scans: std::array::from_fn(|_| AtomicU64::new(0)),
+            account_scan_accounts_returned: std::array::from_fn(|_| AtomicU64::new(0)),
             accounts_scan_max_root_distance: AtomicU64::new(0),
             jemalloc_allocated_bytes: AtomicU64::new(0),
             jemalloc_resident_bytes: AtomicU64::new(0),
@@ -101,12 +100,6 @@ impl Default for PullMetrics {
             rpc_responses_error: std::array::from_fn(|_| AtomicU64::new(0)),
             rpc_duration_micros: std::array::from_fn(|_| AtomicU64::new(0)),
             rpc_in_flight_by_method: std::array::from_fn(|_| AtomicU64::new(0)),
-            rpc_account_scans: std::array::from_fn(|_| {
-                std::array::from_fn(|_| AtomicU64::new(0))
-            }),
-            rpc_account_scan_accounts_returned: std::array::from_fn(|_| {
-                std::array::from_fn(|_| AtomicU64::new(0))
-            }),
         }
     }
 }
@@ -127,6 +120,22 @@ impl PullMetrics {
         );
         self.accounts_scan_completed_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_account_scan(&self, kind: AccountScanKind) {
+        self.account_scans[kind.slot()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_account_scan_accounts_returned(
+        &self,
+        kind: AccountScanKind,
+        accounts_returned: usize,
+    ) {
+        let accounts_returned = u64::try_from(accounts_returned).unwrap_or(u64::MAX);
+        let counter = &self.account_scan_accounts_returned[kind.slot()];
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            Some(value.saturating_add(accounts_returned))
+        });
     }
 
     pub fn record_rpc_request(&self, slot: usize) {
@@ -158,40 +167,14 @@ impl PullMetrics {
     pub fn finish_rpc_request(&self, slot: usize) {
         if let Some(counter) = self.rpc_in_flight_by_method.get(slot) {
             // Keep the gauge valid even if a caller accidentally finishes a
-            // request more than once.  In particular, never wrap to u64::MAX.
+            // request more than once. In particular, never wrap to u64::MAX.
             let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_sub(1)
             });
         }
     }
 
-    pub fn record_rpc_account_scan(
-        &self,
-        method_slot: usize,
-        kind: AccountScanKind,
-        accounts_returned: usize,
-    ) {
-        let kind_slot = kind.slot();
-        if let Some(counter) = self
-            .rpc_account_scans
-            .get(method_slot)
-            .and_then(|counters| counters.get(kind_slot))
-        {
-            counter.fetch_add(1, Ordering::Relaxed);
-        }
-        if let Some(counter) = self
-            .rpc_account_scan_accounts_returned
-            .get(method_slot)
-            .and_then(|counters| counters.get(kind_slot))
-        {
-            let accounts_returned = u64::try_from(accounts_returned).unwrap_or(u64::MAX);
-            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                Some(value.saturating_add(accounts_returned))
-            });
-        }
-    }
-
-    /// Publish one complete allocator sample.  Callers should only invoke this
+    /// Publish one complete allocator sample. Callers should only invoke this
     /// after all four values have been read successfully.
     pub fn store_jemalloc_stats(&self, allocated: u64, active: u64, resident: u64, retained: u64) {
         self.jemalloc_allocated_bytes
@@ -239,6 +222,26 @@ impl PullMetrics {
             "agave_accounts_scan_completed_total",
             self.accounts_scan_completed_total
         );
+        for (kind_slot, kind_label) in ACCOUNT_SCAN_KIND_LABELS.iter().enumerate() {
+            output.push_str("agave_accounts_scans_total{kind=\"");
+            output.push_str(kind_label);
+            output.push_str("\"} ");
+            output.push_str(
+                &self.account_scans[kind_slot]
+                    .load(Ordering::Relaxed)
+                    .to_string(),
+            );
+            output.push('\n');
+            output.push_str("agave_accounts_scan_accounts_returned_total{kind=\"");
+            output.push_str(kind_label);
+            output.push_str("\"} ");
+            output.push_str(
+                &self.account_scan_accounts_returned[kind_slot]
+                    .load(Ordering::Relaxed)
+                    .to_string(),
+            );
+            output.push('\n');
+        }
         gauge!(
             "agave_accounts_scan_max_root_distance",
             self.accounts_scan_max_root_distance
@@ -297,32 +300,6 @@ impl PullMetrics {
                     .to_string(),
             );
             output.push('\n');
-            for (kind_slot, kind_label) in ACCOUNT_SCAN_KIND_LABELS.iter().enumerate() {
-                output.push_str("agave_rpc_account_scans_total{method=\"");
-                output.push_str(label);
-                output.push_str("\",kind=\"");
-                output.push_str(kind_label);
-                output.push_str("\"} ");
-                output.push_str(
-                    &self.rpc_account_scans[slot][kind_slot]
-                        .load(Ordering::Relaxed)
-                        .to_string(),
-                );
-                output.push('\n');
-                output.push_str(
-                    "agave_rpc_account_scan_accounts_returned_total{method=\"",
-                );
-                output.push_str(label);
-                output.push_str("\",kind=\"");
-                output.push_str(kind_label);
-                output.push_str("\"} ");
-                output.push_str(
-                    &self.rpc_account_scan_accounts_returned[slot][kind_slot]
-                        .load(Ordering::Relaxed)
-                        .to_string(),
-                );
-                output.push('\n');
-            }
         }
         output
     }
@@ -346,13 +323,14 @@ mod tests {
             .store(168, Ordering::Relaxed);
         metrics.accounts_scan_active.store(99, Ordering::Relaxed);
         metrics.record_accounts_scan_start();
+        metrics.record_account_scan(AccountScanKind::Indexed);
+        metrics.record_account_scan_accounts_returned(AccountScanKind::Indexed, 12);
         metrics
             .accounts_scan_max_root_distance
             .store(7, Ordering::Relaxed);
         metrics.store_jemalloc_stats(10, 20, 30, 40);
         metrics.record_rpc_request(3);
         metrics.record_rpc_completion(3, Duration::from_micros(1_500_000), Some(true));
-        metrics.record_rpc_account_scan(3, AccountScanKind::Indexed, 12);
         let output = metrics.exposition();
         assert!(output.contains("agave_accounts_index_count_in_mem 42\n"));
         assert!(output.contains("agave_accounts_index_capacity_in_mem 84\n"));
@@ -360,6 +338,10 @@ mod tests {
         assert!(output.contains("agave_accounts_scan_active 1\n"));
         assert!(output.contains("agave_accounts_scan_started_total 1\n"));
         assert!(output.contains("agave_accounts_scan_completed_total 0\n"));
+        assert!(output.contains("agave_accounts_scans_total{kind=\"indexed\"} 1\n"));
+        assert!(output.contains(
+            "agave_accounts_scan_accounts_returned_total{kind=\"indexed\"} 12\n"
+        ));
         assert!(output.contains("agave_accounts_scan_max_root_distance 7\n"));
         assert!(output.contains("agave_jemalloc_allocated_bytes 10\n"));
         assert!(output.contains("agave_jemalloc_active_bytes 20\n"));
@@ -377,12 +359,6 @@ mod tests {
             "agave_rpc_duration_seconds_total{method=\"getHealth\"} 1.5\n"
         ));
         assert!(output.contains("agave_rpc_in_flight{method=\"getHealth\"} 1\n"));
-        assert!(output.contains(
-            "agave_rpc_account_scans_total{method=\"getHealth\",kind=\"indexed\"} 1\n"
-        ));
-        assert!(output.contains(
-            "agave_rpc_account_scan_accounts_returned_total{method=\"getHealth\",kind=\"indexed\"} 12\n"
-        ));
     }
 
     #[test]
@@ -431,20 +407,18 @@ mod tests {
     #[test]
     fn account_scan_kind_and_results_are_bounded() {
         let metrics = PullMetrics::default();
-        let slot = rpc_method_slot("getProgramAccounts");
-        metrics.record_rpc_account_scan(slot, AccountScanKind::Full, 2);
-        metrics.record_rpc_account_scan(slot, AccountScanKind::Full, 3);
-        metrics.record_rpc_account_scan(slot, AccountScanKind::Indexed, 7);
+        metrics.record_account_scan(AccountScanKind::Full);
+        metrics.record_account_scan(AccountScanKind::Full);
+        metrics.record_account_scan_accounts_returned(AccountScanKind::Full, 2);
+        metrics.record_account_scan_accounts_returned(AccountScanKind::Full, 3);
+        metrics.record_account_scan(AccountScanKind::Indexed);
+        metrics.record_account_scan_accounts_returned(AccountScanKind::Indexed, 7);
         let output = metrics.exposition();
+        assert!(output.contains("agave_accounts_scans_total{kind=\"full\"} 2\n"));
         assert!(output.contains(
-            "agave_rpc_account_scans_total{method=\"getProgramAccounts\",kind=\"full\"} 2\n"
+            "agave_accounts_scan_accounts_returned_total{kind=\"full\"} 5\n"
         ));
-        assert!(output.contains(
-            "agave_rpc_account_scan_accounts_returned_total{method=\"getProgramAccounts\",kind=\"full\"} 5\n"
-        ));
-        assert!(output.contains(
-            "agave_rpc_account_scans_total{method=\"getProgramAccounts\",kind=\"indexed\"} 1\n"
-        ));
+        assert!(output.contains("agave_accounts_scans_total{kind=\"indexed\"} 1\n"));
     }
 
     #[test]
