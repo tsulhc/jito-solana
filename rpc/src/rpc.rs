@@ -1135,8 +1135,7 @@ impl JsonRpcRequestProcessor {
             // occurs. No automatic retry loop is started; future requests can elect a new producer.
             let cache = Arc::clone(&self.largest_accounts_cache);
             let coordinator = Arc::clone(&self.largest_accounts_coordinator);
-            let runtime = Arc::clone(&self.runtime);
-            let runtime_for_task = Arc::clone(&runtime);
+            let runtime_handle = self.runtime.handle().clone();
             let bank_clone = Arc::clone(&bank);
             let filter_clone = filter_key.clone();
             let entry_clone = Arc::clone(&entry);
@@ -1147,7 +1146,7 @@ impl JsonRpcRequestProcessor {
                 filter_clone.clone(),
                 Arc::clone(&entry_clone),
             );
-            runtime.spawn(async move {
+            runtime_handle.spawn(async move {
                 // Hold lease for RAII; its Drop will publish terminal error and clean
                 // only the matching generation if task is aborted before completion.
                 let lease = lease;
@@ -1156,9 +1155,7 @@ impl JsonRpcRequestProcessor {
                 let compute_result: std::result::Result<(u64, Vec<RpcAccountBalance>), String> = async {
                     let (addresses, address_filter) = if let Some(ref filter) = filter_clone {
                         let bank_for_calc = Arc::clone(&bank_clone);
-                        let rt_clone = Arc::clone(&runtime_for_task);
-                        let non_circulating = rt_clone
-                            .spawn_blocking(move || {
+                        let non_circulating = tokio::task::spawn_blocking(move || {
                                 calculate_non_circulating_supply(
                                     &bank_for_calc,
                                     ScanOrigin::GetLargestAccounts,
@@ -1182,9 +1179,7 @@ impl JsonRpcRequestProcessor {
                     };
 
                     let bank_for_largest = Arc::clone(&bank_clone);
-                    let rt_clone2 = Arc::clone(&runtime_for_task);
-                    let largest = rt_clone2
-                        .spawn_blocking(move || {
+                    let largest = tokio::task::spawn_blocking(move || {
                             bank_for_largest.get_largest_accounts(
                                 NUM_LARGEST_ACCOUNTS,
                                 &addresses,
