@@ -2,7 +2,10 @@ use {
     solana_rpc_client_api::{config::RpcLargestAccountsFilter, response::RpcAccountBalance},
     std::{
         collections::HashMap,
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        },
         time::{Duration, SystemTime},
     },
     tokio::sync::watch,
@@ -137,6 +140,54 @@ impl LargestAccountsSingleflight {
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.inner.lock().unwrap().is_empty()
+    }
+}
+
+/// RAII lease for a singleflight producer. Constructed synchronously before `runtime.spawn`
+/// so Drop runs even if the spawned future is never polled (aborted before first poll or runtime shutdown).
+/// On Drop, if not marked completed, publishes terminal error and removes only the matching entry (generation check).
+pub(crate) struct SingleflightLease {
+    coordinator: Arc<LargestAccountsSingleflight>,
+    key: Option<RpcLargestAccountsFilter>,
+    entry: Arc<InflightEntry>,
+    completed: AtomicBool,
+}
+
+impl SingleflightLease {
+    pub(crate) fn new(
+        coordinator: Arc<LargestAccountsSingleflight>,
+        key: Option<RpcLargestAccountsFilter>,
+        entry: Arc<InflightEntry>,
+    ) -> Self {
+        Self {
+            coordinator,
+            key,
+            entry,
+            completed: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn mark_completed(&self) {
+        self.completed.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for SingleflightLease {
+    fn drop(&mut self) {
+        if self.completed.load(Ordering::SeqCst) {
+            return;
+        }
+        // Abnormal termination: wake waiters and clean only matching generation.
+        let _ = self
+            .entry
+            .sender
+            .send(Some(Err("producer task aborted".to_string())));
+        let mut map = self.coordinator.inner.lock().unwrap();
+        if let Some(existing) = map.get(&self.key) {
+            if Arc::ptr_eq(existing, &self.entry) {
+                map.remove(&self.key);
+            }
+        }
     }
 }
 

@@ -1104,11 +1104,18 @@ impl JsonRpcRequestProcessor {
             // starting a duplicate scan.
             if let Some((slot, accounts)) = self.get_cached_largest_accounts(&filter_key) {
                 let _ = entry.sender.send(Some(Ok((slot, accounts.clone()))));
-                self.largest_accounts_coordinator
-                    .inner
-                    .lock()
-                    .unwrap()
-                    .remove(&filter_key);
+                {
+                    let mut map = self
+                        .largest_accounts_coordinator
+                        .inner
+                        .lock()
+                        .unwrap();
+                    if let Some(existing) = map.get(&filter_key) {
+                        if Arc::ptr_eq(existing, &entry) {
+                            map.remove(&filter_key);
+                        }
+                    }
+                }
                 return Ok(RpcResponse {
                     context: RpcResponseContext::new(slot),
                     value: accounts,
@@ -1133,33 +1140,17 @@ impl JsonRpcRequestProcessor {
             let bank_clone = Arc::clone(&bank);
             let filter_clone = filter_key.clone();
             let entry_clone = Arc::clone(&entry);
+            // Construct RAII lease synchronously before spawn so Drop runs even if
+            // the spawned future is never polled (aborted before first poll or runtime shutdown).
+            let lease = crate::rpc_cache::SingleflightLease::new(
+                Arc::clone(&coordinator),
+                filter_clone.clone(),
+                Arc::clone(&entry_clone),
+            );
             runtime.spawn(async move {
-                struct Guard {
-                    coordinator: Arc<LargestAccountsSingleflight>,
-                    key: Option<RpcLargestAccountsFilter>,
-                    entry: Arc<crate::rpc_cache::InflightEntry>,
-                    done: bool,
-                }
-                impl Drop for Guard {
-                    fn drop(&mut self) {
-                        if !self.done {
-                            // Abnormal termination: wake all waiters and ensure marker is cleared.
-                            // No negative cache, no stale in-flight, retryable for future requests.
-                            let _ = self
-                                .entry
-                                .sender
-                                .send(Some(Err("producer task aborted".to_string())));
-                            let mut map = self.coordinator.inner.lock().unwrap();
-                            map.remove(&self.key);
-                        }
-                    }
-                }
-                let mut guard = Guard {
-                    coordinator: Arc::clone(&coordinator),
-                    key: filter_clone.clone(),
-                    entry: Arc::clone(&entry_clone),
-                    done: false,
-                };
+                // Hold lease for RAII; its Drop will publish terminal error and clean
+                // only the matching generation if task is aborted before completion.
+                let lease = lease;
 
                 // Execute exactly the existing miss path using the first request's already-selected Bank and filter.
                 let compute_result: std::result::Result<(u64, Vec<RpcAccountBalance>), String> = async {
@@ -1227,12 +1218,16 @@ impl JsonRpcRequestProcessor {
                 match compute_result {
                     Ok((slot, accounts)) => {
                         // Publish the exact (slot, accounts) to waiters; waiters must not construct from own Bank.
-                        let _ = entry_clone.sender.send(Some(Ok((slot, accounts))));
+                        let _ = entry_clone.sender.send(Some(Ok((slot, accounts.clone()))));
                         {
                             let mut map = coordinator.inner.lock().unwrap();
-                            map.remove(&filter_clone);
+                            if let Some(existing) = map.get(&filter_clone) {
+                                if Arc::ptr_eq(existing, &entry_clone) {
+                                    map.remove(&filter_clone);
+                                }
+                            }
                         }
-                        guard.done = true;
+                        lease.mark_completed();
                     }
                     Err(msg) => {
                         // Preserve existing scan errors as RpcCustomError::ScanError with same message;
@@ -1240,9 +1235,13 @@ impl JsonRpcRequestProcessor {
                         let _ = entry_clone.sender.send(Some(Err(msg)));
                         {
                             let mut map = coordinator.inner.lock().unwrap();
-                            map.remove(&filter_clone);
+                            if let Some(existing) = map.get(&filter_clone) {
+                                if Arc::ptr_eq(existing, &entry_clone) {
+                                    map.remove(&filter_clone);
+                                }
+                            }
                         }
-                        guard.done = true;
+                        lease.mark_completed();
                     }
                 }
             });
@@ -10894,5 +10893,124 @@ pub mod tests {
         assert!(coordinator.is_empty());
         // Also verify production cache duration constant is 7200 by checking cache still hits after 1 sec but would expire only after 7200
         // This proves coordinator does not change TTL behavior.
+    }
+
+    #[tokio::test]
+    async fn test_largest_accounts_abort_before_first_poll() {
+        // Audit finding: lease must be constructed before spawn so Drop runs even if future never polled.
+        // Arrange producer entry + waiter, create/spawn owned task, abort/drop before poll,
+        // assert waiter completes (no deadlock), in-flight empty, cache not falsely populated,
+        // future request can elect exactly one new producer. Also verify generation check.
+        use crate::rpc_cache::{LargestAccountsCache, LargestAccountsSingleflight, SingleflightLease};
+        use solana_rpc_client_api::{config::RpcLargestAccountsFilter, response::RpcAccountBalance};
+        use std::{
+            sync::{Arc, RwLock},
+            time::Duration,
+        };
+        let coordinator = Arc::new(LargestAccountsSingleflight::new());
+        let cache = Arc::new(RwLock::new(LargestAccountsCache::new(7200)));
+        let filter = Some(RpcLargestAccountsFilter::Circulating);
+
+        // Case A: future dropped without ever being polled (synchronous lease Drop)
+        let (is_prod, entry) = coordinator.get_or_create(&filter);
+        assert!(is_prod);
+        let waiter = {
+            let e = entry.clone();
+            tokio::spawn(async move { e.wait().await })
+        };
+        let lease = SingleflightLease::new(coordinator.clone(), filter.clone(), entry.clone());
+        let fut = async move {
+            let _lease = lease;
+            std::future::pending::<()>().await;
+        };
+        drop(fut); // never polled, lease Drop should clean
+        let res = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("deadlock: waiter did not wake")
+            .unwrap();
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("aborted"));
+        assert!(coordinator.is_empty(), "in-flight should be empty after abort-before-poll");
+        assert!(
+            cache.read().unwrap().get_largest_accounts(&filter).is_none(),
+            "cache should not be falsely populated"
+        );
+        // Future request can elect exactly one new producer
+        let (is_prod2, entry2) = coordinator.get_or_create(&filter);
+        assert!(is_prod2);
+        let (is_prod3, _) = coordinator.get_or_create(&filter);
+        assert!(!is_prod3, "should not create concurrent recovery producers");
+        // Cleanup gen2
+        let _ = entry2.sender.send(Some(Ok((999, vec![RpcAccountBalance {
+            address: "X".to_string(),
+            lamports: 999,
+        }]))));
+        {
+            let mut map = coordinator.inner.lock().unwrap();
+            if let Some(existing) = map.get(&filter) {
+                if Arc::ptr_eq(existing, &entry2) {
+                    map.remove(&filter);
+                }
+            }
+        }
+        assert!(coordinator.is_empty());
+
+        // Case B: tokio::spawn + abort before poll
+        let (is_prod_a, entry_a) = coordinator.get_or_create(&filter);
+        assert!(is_prod_a);
+        let waiter_a = {
+            let e = entry_a.clone();
+            tokio::spawn(async move { e.wait().await })
+        };
+        let lease_a = SingleflightLease::new(coordinator.clone(), filter.clone(), entry_a.clone());
+        let handle = tokio::spawn(async move {
+            let _lease = lease_a;
+            std::future::pending::<()>().await;
+        });
+        handle.abort();
+        let _ = handle.await;
+        let res_a = tokio::time::timeout(Duration::from_secs(2), waiter_a)
+            .await
+            .expect("deadlock")
+            .unwrap();
+        assert!(res_a.is_err());
+        assert!(res_a.unwrap_err().contains("aborted"));
+        assert!(coordinator.is_empty());
+        assert!(cache.read().unwrap().get_largest_accounts(&filter).is_none());
+
+        // Generation check: stale lease must not delete newer generation
+        let (is_prod_b, entry_b) = coordinator.get_or_create(&filter);
+        assert!(is_prod_b);
+        let lease_b = SingleflightLease::new(coordinator.clone(), filter.clone(), entry_b.clone());
+        let _ = entry_b.sender.send(Some(Ok((1, vec![]))));
+        {
+            let mut map = coordinator.inner.lock().unwrap();
+            if let Some(existing) = map.get(&filter) {
+                if Arc::ptr_eq(existing, &entry_b) {
+                    map.remove(&filter);
+                }
+            }
+        }
+        lease_b.mark_completed();
+        assert!(coordinator.is_empty());
+        let (is_prod_c, entry_c) = coordinator.get_or_create(&filter);
+        assert!(is_prod_c);
+        let stale_lease = SingleflightLease::new(coordinator.clone(), filter.clone(), entry_b.clone());
+        drop(stale_lease); // should not delete entry_c
+        assert!(coordinator.is_inflight(&filter));
+        assert!(Arc::ptr_eq(
+            &coordinator.inner.lock().unwrap().get(&filter).unwrap(),
+            &entry_c
+        ));
+        let _ = entry_c.sender.send(Some(Ok((2, vec![]))));
+        {
+            let mut map = coordinator.inner.lock().unwrap();
+            if let Some(existing) = map.get(&filter) {
+                if Arc::ptr_eq(existing, &entry_c) {
+                    map.remove(&filter);
+                }
+            }
+        }
+        assert!(coordinator.is_empty());
     }
 }
