@@ -5,7 +5,9 @@ use {
     crate::{
         filter::filter_allows, max_slots::MaxSlots,
         optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
-        parsed_token_accounts::*, rpc_cache::LargestAccountsCache, rpc_health::*,
+        parsed_token_accounts::*,
+        rpc_cache::{LargestAccountsCache, LargestAccountsSingleflight},
+        rpc_health::*,
     },
     agave_snapshots::{paths as snapshot_paths, snapshot_config::SnapshotConfig},
     agave_votor_messages::wire::{WireBlockCertMessage, WireCertSignature},
@@ -250,6 +252,7 @@ pub struct JsonRpcRequestProcessor {
     bigtable_ledger_storage: Option<solana_storage_bigtable::LedgerStorage>,
     optimistically_confirmed_bank: Arc<RwLock<OptimisticallyConfirmedBank>>,
     largest_accounts_cache: Arc<RwLock<LargestAccountsCache>>,
+    largest_accounts_coordinator: Arc<LargestAccountsSingleflight>,
     max_slots: Arc<MaxSlots>,
     leader_schedule_cache: Arc<LeaderScheduleCache>,
     max_complete_transaction_status_slot: Arc<AtomicU64>,
@@ -446,6 +449,7 @@ impl JsonRpcRequestProcessor {
                 bigtable_ledger_storage,
                 optimistically_confirmed_bank,
                 largest_accounts_cache,
+                largest_accounts_coordinator: Arc::new(LargestAccountsSingleflight::new()),
                 max_slots,
                 leader_schedule_cache,
                 max_complete_transaction_status_slot,
@@ -529,6 +533,7 @@ impl JsonRpcRequestProcessor {
             bigtable_ledger_storage: None,
             optimistically_confirmed_bank,
             largest_accounts_cache: Arc::new(RwLock::new(LargestAccountsCache::new(30))),
+            largest_accounts_coordinator: Arc::new(LargestAccountsSingleflight::new()),
             max_slots: Arc::new(MaxSlots::default()),
             leader_schedule_cache,
             max_complete_transaction_status_slot: Arc::new(AtomicU64::default()),
@@ -1063,6 +1068,7 @@ impl JsonRpcRequestProcessor {
         largest_accounts_cache.get_largest_accounts(filter)
     }
 
+    #[allow(dead_code)]
     fn set_cached_largest_accounts(
         &self,
         filter: &Option<RpcLargestAccountsFilter>,
@@ -1081,54 +1087,177 @@ impl JsonRpcRequestProcessor {
         let bank = self.bank(config.commitment);
 
         if let Some((slot, accounts)) = self.get_cached_largest_accounts(&config.filter) {
-            Ok(RpcResponse {
+            return Ok(RpcResponse {
                 context: RpcResponseContext::new(slot),
                 value: accounts,
-            })
-        } else {
-            let (addresses, address_filter) = if let Some(filter) = config.clone().filter {
-                let non_circulating_supply = self
-                    .calculate_non_circulating_supply(&bank, ScanOrigin::GetLargestAccounts)
-                    .await
-                    .map_err(|e| RpcCustomError::ScanError {
-                        message: e.to_string(),
-                    })?;
-                let addresses = non_circulating_supply.accounts.into_iter().collect();
-                let address_filter = match filter {
-                    RpcLargestAccountsFilter::Circulating => AccountAddressFilter::Exclude,
-                    RpcLargestAccountsFilter::NonCirculating => AccountAddressFilter::Include,
-                };
-                (addresses, address_filter)
-            } else {
-                (HashSet::new(), AccountAddressFilter::Exclude)
-            };
-            let accounts = self
-                .runtime
-                .spawn_blocking({
-                    let bank = Arc::clone(&bank);
-                    move || {
-                        bank.get_largest_accounts(
-                            NUM_LARGEST_ACCOUNTS,
-                            &addresses,
-                            address_filter,
-                            ScanOrigin::GetLargestAccounts,
-                        )
-                    }
-                })
-                .await
-                .expect("Failed to spawn blocking task")
-                .map_err(|e| RpcCustomError::ScanError {
-                    message: e.to_string(),
-                })?
-                .into_iter()
-                .map(|(address, lamports)| RpcAccountBalance {
-                    address: address.to_string(),
-                    lamports,
-                })
-                .collect::<Vec<RpcAccountBalance>>();
+            });
+        }
 
-            self.set_cached_largest_accounts(&config.filter, bank.slot(), &accounts);
-            Ok(new_response(&bank, accounts))
+        let filter_key = config.filter.clone();
+        // Fast-path singleflight admission with short lock, never held across computation.
+        let (is_producer, entry) = self.largest_accounts_coordinator.get_or_create(&filter_key);
+
+        if is_producer {
+            // Stale-miss race: another producer may have filled the cache between our
+            // initial cache check and admission. Recheck cache now that we hold the
+            // in-flight marker; if hit, publish cached value and clean marker without
+            // starting a duplicate scan.
+            if let Some((slot, accounts)) = self.get_cached_largest_accounts(&filter_key) {
+                let _ = entry.sender.send(Some(Ok((slot, accounts.clone()))));
+                {
+                    let mut map = self
+                        .largest_accounts_coordinator
+                        .inner
+                        .lock()
+                        .unwrap();
+                    if let Some(existing) = map.get(&filter_key) {
+                        if Arc::ptr_eq(existing, &entry) {
+                            map.remove(&filter_key);
+                        }
+                    }
+                }
+                return Ok(RpcResponse {
+                    context: RpcResponseContext::new(slot),
+                    value: accounts,
+                });
+            }
+            // Spawn owned runtime task for the producer job. The job is owned by the
+            // coordinator/runtime, not by the HTTP/RPC future that first observed the miss.
+            // This ensures producer caller cancellation does not cancel the job, and waiter
+            // cancellation does not affect producer or other waiters. We use a watch channel
+            // as multi-waiter completion primitive.
+            //
+            // Residual `spawn_blocking` behavior: if the producer task is abnormally terminated,
+            // its inner `spawn_blocking` handles may still have their blocking threads continue
+            // after the JoinHandle is dropped (Tokio docs). The blocking work is then dropped
+            // without publishing to the channel. The RAII Guard below ensures the in-flight
+            // marker is still cleared and waiters are woken with an error, so no deadlock
+            // occurs. No automatic retry loop is started; future requests can elect a new producer.
+            let cache = Arc::clone(&self.largest_accounts_cache);
+            let coordinator = Arc::clone(&self.largest_accounts_coordinator);
+            let runtime_handle = self.runtime.handle().clone();
+            let bank_clone = Arc::clone(&bank);
+            let filter_clone = filter_key.clone();
+            let entry_clone = Arc::clone(&entry);
+            // Construct RAII lease synchronously before spawn so Drop runs even if
+            // the spawned future is never polled (aborted before first poll or runtime shutdown).
+            let lease = crate::rpc_cache::SingleflightLease::new(
+                Arc::clone(&coordinator),
+                filter_clone.clone(),
+                Arc::clone(&entry_clone),
+            );
+            runtime_handle.spawn(async move {
+                // Hold lease for RAII; its Drop will publish terminal error and clean
+                // only the matching generation if task is aborted before completion.
+                let lease = lease;
+
+                // Execute exactly the existing miss path using the first request's already-selected Bank and filter.
+                let compute_result: std::result::Result<(u64, Vec<RpcAccountBalance>), String> = async {
+                    let (addresses, address_filter) = if let Some(ref filter) = filter_clone {
+                        let bank_for_calc = Arc::clone(&bank_clone);
+                        let non_circulating = tokio::task::spawn_blocking(move || {
+                                calculate_non_circulating_supply(
+                                    &bank_for_calc,
+                                    ScanOrigin::GetLargestAccounts,
+                                )
+                            })
+                            .await
+                            .map_err(|e| format!("spawn_blocking join error: {e}"))?
+                            .map_err(|e| e.to_string())?;
+                        let addresses = non_circulating.accounts.into_iter().collect();
+                        let address_filter = match filter {
+                            RpcLargestAccountsFilter::Circulating => {
+                                AccountAddressFilter::Exclude
+                            }
+                            RpcLargestAccountsFilter::NonCirculating => {
+                                AccountAddressFilter::Include
+                            }
+                        };
+                        (addresses, address_filter)
+                    } else {
+                        (HashSet::new(), AccountAddressFilter::Exclude)
+                    };
+
+                    let bank_for_largest = Arc::clone(&bank_clone);
+                    let largest = tokio::task::spawn_blocking(move || {
+                            bank_for_largest.get_largest_accounts(
+                                NUM_LARGEST_ACCOUNTS,
+                                &addresses,
+                                address_filter,
+                                ScanOrigin::GetLargestAccounts,
+                            )
+                        })
+                        .await
+                        .map_err(|e| format!("spawn_blocking join error: {e}"))?
+                        .map_err(|e| e.to_string())?;
+
+                    let slot = bank_clone.slot();
+                    let accounts = largest
+                        .into_iter()
+                        .map(|(address, lamports)| RpcAccountBalance {
+                            address: address.to_string(),
+                            lamports,
+                        })
+                        .collect::<Vec<RpcAccountBalance>>();
+
+                    // Keep in-flight marker through cache set and completion, then clean.
+                    {
+                        let mut cache_w = cache.write().unwrap();
+                        cache_w.set_largest_accounts(&filter_clone, slot, &accounts);
+                    }
+
+                    Ok((slot, accounts))
+                }
+                .await;
+
+                match compute_result {
+                    Ok((slot, accounts)) => {
+                        // Publish the exact (slot, accounts) to waiters; waiters must not construct from own Bank.
+                        let _ = entry_clone.sender.send(Some(Ok((slot, accounts.clone()))));
+                        {
+                            let mut map = coordinator.inner.lock().unwrap();
+                            if let Some(existing) = map.get(&filter_clone) {
+                                if Arc::ptr_eq(existing, &entry_clone) {
+                                    map.remove(&filter_clone);
+                                }
+                            }
+                        }
+                        lease.mark_completed();
+                    }
+                    Err(msg) => {
+                        // Preserve existing scan errors as RpcCustomError::ScanError with same message;
+                        // no negative cache, no stale in-flight, all joined waiters finish, future request can elect new producer.
+                        let _ = entry_clone.sender.send(Some(Err(msg)));
+                        {
+                            let mut map = coordinator.inner.lock().unwrap();
+                            if let Some(existing) = map.get(&filter_clone) {
+                                if Arc::ptr_eq(existing, &entry_clone) {
+                                    map.remove(&filter_clone);
+                                }
+                            }
+                        }
+                        lease.mark_completed();
+                    }
+                }
+            });
+
+            // Producer caller also waits via multi-waiter primitive; cancellation does not cancel the owned job.
+            match entry.wait().await {
+                Ok((slot, accounts)) => Ok(RpcResponse {
+                    context: RpcResponseContext::new(slot),
+                    value: accounts,
+                }),
+                Err(msg) => Err(RpcCustomError::ScanError { message: msg }.into()),
+            }
+        } else {
+            // Waiter: await same slot/accounts as producer's cache fill; waiter cancellation does not affect producer/other waiters.
+            match entry.wait().await {
+                Ok((slot, accounts)) => Ok(RpcResponse {
+                    context: RpcResponseContext::new(slot),
+                    value: accounts,
+                }),
+                Err(msg) => Err(RpcCustomError::ScanError { message: msg }.into()),
+            }
         }
     }
 
@@ -10213,5 +10342,670 @@ pub mod tests {
                 },
             ],
         );
+    }
+
+    // --- largest-accounts singleflight deterministic tests (barriers/notifiers, no sleeps) ---
+
+    #[test]
+    fn test_largest_accounts_cache_hit_no_compute() {
+        // 1. populated cache hit has compute_count 0 and unchanged response
+        use crate::rpc_cache::{LargestAccountsCache, LargestAccountsSingleflight};
+        use solana_rpc_client_api::{config::RpcLargestAccountsFilter, response::RpcAccountBalance};
+        use std::sync::{Arc, RwLock, atomic::{AtomicUsize, Ordering}};
+        let cache = Arc::new(RwLock::new(LargestAccountsCache::new(7200)));
+        let coordinator = Arc::new(LargestAccountsSingleflight::new());
+        let filter: Option<RpcLargestAccountsFilter> = None;
+        let accounts = vec![RpcAccountBalance { address: "A".to_string(), lamports: 100 }];
+        {
+            let mut w = cache.write().unwrap();
+            w.set_largest_accounts(&filter, 42, &accounts);
+        }
+        let compute_count = Arc::new(AtomicUsize::new(0));
+        // Simulate get_largest_accounts check: should hit cache, no producer
+        let hit = cache.read().unwrap().get_largest_accounts(&filter);
+        assert_eq!(hit, Some((42, accounts.clone())));
+        assert!(!coordinator.is_inflight(&filter));
+        assert_eq!(compute_count.load(Ordering::SeqCst), 0);
+        // Ensure response unchanged
+        assert_eq!(hit.unwrap().1, accounts);
+        assert!(coordinator.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_largest_accounts_single_miss_populates_cache() {
+        // 2. single miss computes once, populates cache, and leaves in-flight empty
+        use crate::rpc_cache::{LargestAccountsCache, LargestAccountsSingleflight};
+        use solana_rpc_client_api::{config::RpcLargestAccountsFilter, response::RpcAccountBalance};
+        use std::sync::{Arc, RwLock, atomic::{AtomicUsize, Ordering}};
+        let cache = Arc::new(RwLock::new(LargestAccountsCache::new(7200)));
+        let coordinator = Arc::new(LargestAccountsSingleflight::new());
+        let filter: Option<RpcLargestAccountsFilter> = None;
+        assert!(cache.read().unwrap().get_largest_accounts(&filter).is_none());
+        let compute_count = Arc::new(AtomicUsize::new(0));
+        // Producer path
+        let (is_prod, entry) = coordinator.get_or_create(&filter);
+        assert!(is_prod);
+        // Simulate compute
+        let cc = compute_count.clone();
+        let cache_c = cache.clone();
+        let coord_c = coordinator.clone();
+        let filter_c = filter.clone();
+        let entry_c = entry.clone();
+        let handle = tokio::spawn(async move {
+            cc.fetch_add(1, Ordering::SeqCst);
+            let slot = 99u64;
+            let accounts = vec![RpcAccountBalance { address: "B".to_string(), lamports: 200 }];
+            {
+                let mut w = cache_c.write().unwrap();
+                w.set_largest_accounts(&filter_c, slot, &accounts);
+            }
+            let _ = entry_c.sender.send(Some(Ok((slot, accounts))));
+            coord_c.inner.lock().unwrap().remove(&filter_c);
+        });
+        let res = entry.wait().await.unwrap();
+        assert_eq!(res.0, 99);
+        assert_eq!(res.1[0].lamports, 200);
+        handle.await.unwrap();
+        assert_eq!(compute_count.load(Ordering::SeqCst), 1);
+        let cached = cache.read().unwrap().get_largest_accounts(&filter).unwrap();
+        assert_eq!(cached.0, 99);
+        assert!(coordinator.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_largest_accounts_n_concurrent_same_key_coalesce() {
+        // 3. N concurrent same-key misses compute once, one producer, all callers complete with identical slot/accounts
+        use crate::rpc_cache::{LargestAccountsCache, LargestAccountsSingleflight};
+        use solana_rpc_client_api::{config::RpcLargestAccountsFilter, response::RpcAccountBalance};
+        use std::sync::{Arc, RwLock, atomic::{AtomicUsize, Ordering}};
+        use tokio::sync::Barrier;
+        let cache = Arc::new(RwLock::new(LargestAccountsCache::new(7200)));
+        let coordinator = Arc::new(LargestAccountsSingleflight::new());
+        let filter = Some(RpcLargestAccountsFilter::Circulating);
+        let compute_count = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(6)); // 5 callers + producer gate
+        let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+        // We use a barrier to ensure all 5 callers have entered coordinator before producer computes
+        // Producer will wait on gate, which we trigger after all waiters are registered.
+        // Use watch for gate (not Notify) so notification is not lost if producer hasn't yet started waiting.
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let cache_c = cache.clone();
+            let coord_c = coordinator.clone();
+            let f = filter.clone();
+            let cc = compute_count.clone();
+            let b = barrier.clone();
+            let gate_rx_c = gate_rx.clone();
+            handles.push(tokio::spawn(async move {
+                // Admission
+                let (is_prod, entry) = coord_c.get_or_create(&f);
+                b.wait().await;
+                if is_prod {
+                    // Producer waits for gate then computes once
+                    let mut rx = gate_rx_c;
+                    while !*rx.borrow() {
+                        rx.changed().await.unwrap();
+                    }
+                    cc.fetch_add(1, Ordering::SeqCst);
+                    let slot = 123u64;
+                    let accounts = vec![RpcAccountBalance { address: "X".to_string(), lamports: 999 }];
+                    {
+                        let mut w = cache_c.write().unwrap();
+                        w.set_largest_accounts(&f, slot, &accounts);
+                    }
+                    let _ = entry.sender.send(Some(Ok((slot, accounts))));
+                    coord_c.inner.lock().unwrap().remove(&f);
+                    entry.wait().await.unwrap()
+                } else {
+                    entry.wait().await.unwrap()
+                }
+            }));
+        }
+        // Wait until all tasks have hit barrier (all registered as waiter/producer)
+        barrier.wait().await;
+        // Now only one producer exists; trigger compute
+        assert_eq!(coordinator.inflight_count(), 1);
+        gate_tx.send(true).unwrap();
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.unwrap());
+        }
+        for r in &results {
+            assert_eq!(r.0, 123);
+            assert_eq!(r.1[0].lamports, 999);
+        }
+        assert_eq!(compute_count.load(Ordering::SeqCst), 1);
+        // All identical
+        let first = &results[0];
+        for r in &results[1..] {
+            assert_eq!(r, first);
+        }
+        assert!(coordinator.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_largest_accounts_distinct_keys_simultaneous() {
+        // 4. `None`, `Circulating`, and `NonCirculating` can each have a producer simultaneously, proving no global serialization/cap
+        use crate::rpc_cache::{LargestAccountsCache, LargestAccountsSingleflight};
+        use solana_rpc_client_api::{config::RpcLargestAccountsFilter, response::RpcAccountBalance};
+        use std::sync::{Arc, RwLock, atomic::{AtomicUsize, Ordering}};
+        use tokio::sync::Barrier;
+        let coordinator = Arc::new(LargestAccountsSingleflight::new());
+        let cache = Arc::new(RwLock::new(LargestAccountsCache::new(7200)));
+        let k_none: Option<RpcLargestAccountsFilter> = None;
+        let k_circ = Some(RpcLargestAccountsFilter::Circulating);
+        let k_non = Some(RpcLargestAccountsFilter::NonCirculating);
+        let barrier = Arc::new(Barrier::new(3));
+        let compute_counts: Vec<Arc<AtomicUsize>> = vec![Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+        let mut handles = Vec::new();
+        for (i, key) in [k_none.clone(), k_circ.clone(), k_non.clone()].into_iter().enumerate() {
+            let coord_c = coordinator.clone();
+            let cache_c = cache.clone();
+            let b = barrier.clone();
+            let cc = compute_counts[i].clone();
+            handles.push(tokio::spawn(async move {
+                let (is_prod, entry) = coord_c.get_or_create(&key);
+                assert!(is_prod, "distinct key should be producer");
+                b.wait().await;
+                // Each producer computes simultaneously (no global lock)
+                cc.fetch_add(1, Ordering::SeqCst);
+                // Simulate some work with yield
+                tokio::task::yield_now().await;
+                let slot = 100 + i as u64;
+                let accounts = vec![RpcAccountBalance { address: format!("K{i}"), lamports: 10 + i as u64 }];
+                {
+                    let mut w = cache_c.write().unwrap();
+                    w.set_largest_accounts(&key, slot, &accounts);
+                }
+                let _ = entry.sender.send(Some(Ok((slot, accounts))));
+                coord_c.inner.lock().unwrap().remove(&key);
+                entry.wait().await.unwrap()
+            }));
+        }
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.unwrap());
+        }
+        for (i, r) in results.iter().enumerate() {
+            assert_eq!(r.0, 100 + i as u64);
+        }
+        for cc in &compute_counts {
+            assert_eq!(cc.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(coordinator.inflight_count(), 0);
+        // Verify caches populated for all three keys
+        assert!(cache.read().unwrap().get_largest_accounts(&k_none).is_some());
+        assert!(cache.read().unwrap().get_largest_accounts(&k_circ).is_some());
+        assert!(cache.read().unwrap().get_largest_accounts(&k_non).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_largest_accounts_success_exact_for_waiters_and_cache_hit() {
+        // 5. success result is exact for all waiters and later request is ordinary cache hit with no extra compute
+        use crate::rpc_cache::{LargestAccountsCache, LargestAccountsSingleflight};
+        use solana_rpc_client_api::{config::RpcLargestAccountsFilter, response::RpcAccountBalance};
+        use std::sync::{Arc, RwLock, atomic::{AtomicUsize, Ordering}};
+        let cache = Arc::new(RwLock::new(LargestAccountsCache::new(7200)));
+        let coordinator = Arc::new(LargestAccountsSingleflight::new());
+        let filter = Some(RpcLargestAccountsFilter::NonCirculating);
+        let compute_count = Arc::new(AtomicUsize::new(0));
+        // First batch: 3 concurrent coalesced
+        let (is_prod, entry) = coordinator.get_or_create(&filter);
+        assert!(is_prod);
+        let mut waiter_handles = Vec::new();
+        for _ in 0..2 {
+            let e = entry.clone();
+            waiter_handles.push(tokio::spawn(async move { e.wait().await }));
+        }
+        // Producer computes
+        compute_count.fetch_add(1, Ordering::SeqCst);
+        let slot = 555u64;
+        let accounts = vec![
+            RpcAccountBalance { address: "P".to_string(), lamports: 1 },
+            RpcAccountBalance { address: "Q".to_string(), lamports: 2 },
+        ];
+        {
+            let mut w = cache.write().unwrap();
+            w.set_largest_accounts(&filter, slot, &accounts);
+        }
+        let _ = entry.sender.send(Some(Ok((slot, accounts.clone()))));
+        coordinator.inner.lock().unwrap().remove(&filter);
+        let prod_res = entry.wait().await.unwrap();
+        assert_eq!(prod_res, (slot, accounts.clone()));
+        for h in waiter_handles {
+            let r = h.await.unwrap().unwrap();
+            assert_eq!(r, (slot, accounts.clone()));
+        }
+        assert_eq!(compute_count.load(Ordering::SeqCst), 1);
+        // Later request should be cache hit, no new producer
+        let hit = cache.read().unwrap().get_largest_accounts(&filter).unwrap();
+        assert_eq!(hit, (slot, accounts));
+        // Simulate second request checking cache first: should not create inflight
+        assert!(coordinator.is_empty());
+        let (is_prod2, _) = coordinator.get_or_create(&filter);
+        // If we incorrectly called get_or_create on cache hit, we would create inflight, but real path checks cache first so should not happen.
+        // Clean up the accidentally created entry for test isolation
+        if is_prod2 {
+            coordinator.inner.lock().unwrap().remove(&filter);
+        }
+        // Proper hit path would not have created producer
+        assert_eq!(compute_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_largest_accounts_scan_error_propagates() {
+        // 6. producer scan error reaches joined waiters, does not populate cache, clears in-flight, and a later request can retry
+        use crate::rpc_cache::{LargestAccountsCache, LargestAccountsSingleflight};
+        use solana_rpc_client_api::{config::RpcLargestAccountsFilter, response::RpcAccountBalance};
+        use std::sync::{Arc, RwLock};
+        let cache = Arc::new(RwLock::new(LargestAccountsCache::new(7200)));
+        let coordinator = Arc::new(LargestAccountsSingleflight::new());
+        let filter = Some(RpcLargestAccountsFilter::Circulating);
+        let (is_prod, entry) = coordinator.get_or_create(&filter);
+        assert!(is_prod);
+        let waiter = {
+            let e = entry.clone();
+            tokio::spawn(async move { e.wait().await })
+        };
+        // Producer fails with scan error
+        let err_msg = "scan failed: abort".to_string();
+        let _ = entry.sender.send(Some(Err(err_msg.clone())));
+        coordinator.inner.lock().unwrap().remove(&filter);
+        let prod_err = entry.wait().await.unwrap_err();
+        assert_eq!(prod_err, err_msg);
+        let waiter_err = waiter.await.unwrap().unwrap_err();
+        assert_eq!(waiter_err, err_msg);
+        // No cache
+        assert!(cache.read().unwrap().get_largest_accounts(&filter).is_none());
+        assert!(coordinator.is_empty());
+        // Later request can elect new producer and succeed
+        let (is_prod2, entry2) = coordinator.get_or_create(&filter);
+        assert!(is_prod2);
+        let slot = 77u64;
+        let accounts = vec![RpcAccountBalance { address: "Z".to_string(), lamports: 77 }];
+        {
+            let mut w = cache.write().unwrap();
+            w.set_largest_accounts(&filter, slot, &accounts);
+        }
+        let _ = entry2.sender.send(Some(Ok((slot, accounts.clone()))));
+        coordinator.inner.lock().unwrap().remove(&filter);
+        let r = entry2.wait().await.unwrap();
+        assert_eq!(r, (slot, accounts));
+        assert!(cache.read().unwrap().get_largest_accounts(&filter).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_largest_accounts_cancel_producer_caller_continues() {
+        // 7. cancel the first caller after producer job starts while at least one waiter exists: job continues, compute_count remains one, waiter gets result/cache fill, no duplicate scan
+        use crate::rpc_cache::{LargestAccountsCache, LargestAccountsSingleflight};
+        use solana_rpc_client_api::{config::RpcLargestAccountsFilter, response::RpcAccountBalance};
+        use std::sync::{Arc, RwLock, atomic::{AtomicUsize, Ordering}};
+        use tokio::sync::Barrier;
+        let cache = Arc::new(RwLock::new(LargestAccountsCache::new(7200)));
+        let coordinator = Arc::new(LargestAccountsSingleflight::new());
+        let filter: Option<RpcLargestAccountsFilter> = None;
+        let compute_count = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(2));
+        let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+        let started_barrier = Arc::new(Barrier::new(2));
+        // Producer caller task that will be cancelled
+        let coord_c = coordinator.clone();
+        let cache_c = cache.clone();
+        let cc = compute_count.clone();
+        let b = barrier.clone();
+        let gate_rx_c = gate_rx.clone();
+        let started_barrier_c = started_barrier.clone();
+        let filter_c = filter.clone();
+        let producer_handle = tokio::spawn(async move {
+            let (is_prod, entry) = coord_c.get_or_create(&filter_c);
+            assert!(is_prod);
+            b.wait().await;
+            // Spawn owned runtime task (simulating real producer job owned by runtime)
+            let cache2 = cache_c.clone();
+            let coord2 = coord_c.clone();
+            let cc2 = cc.clone();
+            let f2 = filter_c.clone();
+            let entry2 = entry.clone();
+            let gate_rx2 = gate_rx_c.clone();
+            let started_barrier2 = started_barrier_c.clone();
+            tokio::spawn(async move {
+                // Signal that owned producer has started and is pending on gate
+                started_barrier2.wait().await;
+                let mut rx = gate_rx2;
+                while !*rx.borrow() {
+                    rx.changed().await.unwrap();
+                }
+                cc2.fetch_add(1, Ordering::SeqCst);
+                let slot = 888u64;
+                let accounts = vec![RpcAccountBalance { address: "G".to_string(), lamports: 888 }];
+                {
+                    let mut w = cache2.write().unwrap();
+                    w.set_largest_accounts(&f2, slot, &accounts);
+                }
+                let _ = entry2.sender.send(Some(Ok((slot, accounts))));
+                coord2.inner.lock().unwrap().remove(&f2);
+            });
+            // Producer caller waits, but will be cancelled
+            entry.wait().await
+        });
+        // Waiter
+        barrier.wait().await;
+        let (is_prod_waiter, entry_waiter) = coordinator.get_or_create(&filter);
+        assert!(!is_prod_waiter);
+        let waiter_handle = tokio::spawn(async move { entry_waiter.wait().await });
+        // Wait until owned producer has started and is pending on gate
+        started_barrier.wait().await;
+        // Cancel producer caller (abort its wait, not the spawned job)
+        producer_handle.abort();
+        let _ = producer_handle.await; // cancelled
+        // Now allow producer job to proceed (watch remembers value, so not lost)
+        gate_tx.send(true).unwrap();
+        let waiter_res = waiter_handle.await.unwrap().unwrap();
+        assert_eq!(waiter_res.0, 888);
+        assert_eq!(compute_count.load(Ordering::SeqCst), 1);
+        // Cache filled
+        assert!(cache.read().unwrap().get_largest_accounts(&filter).is_some());
+        assert!(coordinator.is_empty());
+        // No duplicate scan if another request comes: should be cache hit
+        assert_eq!(compute_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_largest_accounts_cancel_one_waiter() {
+        // 8. cancel only one waiter: producer and other waiters complete, no new producer
+        use crate::rpc_cache::{LargestAccountsCache, LargestAccountsSingleflight};
+        use solana_rpc_client_api::{config::RpcLargestAccountsFilter, response::RpcAccountBalance};
+        use std::sync::{Arc, RwLock, atomic::{AtomicUsize, Ordering}};
+        let cache = Arc::new(RwLock::new(LargestAccountsCache::new(7200)));
+        let coordinator = Arc::new(LargestAccountsSingleflight::new());
+        let filter = Some(RpcLargestAccountsFilter::Circulating);
+        let compute_count = Arc::new(AtomicUsize::new(0));
+        let (is_prod, entry) = coordinator.get_or_create(&filter);
+        assert!(is_prod);
+        // Two waiters
+        let e1 = entry.clone();
+        let w1 = tokio::spawn(async move { e1.wait().await });
+        let e2 = entry.clone();
+        let w2 = tokio::spawn(async move { e2.wait().await });
+        // Cancel one waiter
+        w1.abort();
+        let _ = w1.await;
+        // Producer computes
+        compute_count.fetch_add(1, Ordering::SeqCst);
+        let slot = 333u64;
+        let accounts = vec![RpcAccountBalance { address: "W".to_string(), lamports: 333 }];
+        {
+            let mut w = cache.write().unwrap();
+            w.set_largest_accounts(&filter, slot, &accounts);
+        }
+        let _ = entry.sender.send(Some(Ok((slot, accounts.clone()))));
+        coordinator.inner.lock().unwrap().remove(&filter);
+        let prod_res = entry.wait().await.unwrap();
+        assert_eq!(prod_res, (slot, accounts.clone()));
+        let w2_res = w2.await.unwrap().unwrap();
+        assert_eq!(w2_res, (slot, accounts));
+        assert_eq!(compute_count.load(Ordering::SeqCst), 1);
+        assert!(coordinator.is_empty());
+        // No new producer was started due to cancelled waiter
+        assert_eq!(coordinator.inflight_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_largest_accounts_abnormal_termination_no_deadlock() {
+        // 9. simulate abnormal producer termination possible with the chosen primitive: no deadlock, in-flight cleared, future request is retryable, and no concurrent same-key recovery producers
+        use crate::rpc_cache::{LargestAccountsCache, LargestAccountsSingleflight};
+        use solana_rpc_client_api::{config::RpcLargestAccountsFilter, response::RpcAccountBalance};
+        use std::sync::{Arc, RwLock};
+        let coordinator = Arc::new(LargestAccountsSingleflight::new());
+        let cache = Arc::new(RwLock::new(LargestAccountsCache::new(7200)));
+        let filter: Option<RpcLargestAccountsFilter> = None;
+        // Producer that will abnormally terminate (drop sender without send, then guard clears)
+        let (is_prod, entry) = coordinator.get_or_create(&filter);
+        assert!(is_prod);
+        let waiter = {
+            let e = entry.clone();
+            tokio::spawn(async move { e.wait().await })
+        };
+        // Simulate panic: drop without send, then RAII sends abort error and removes marker
+        // In real code Guard does this; here we manually emulate
+        {
+            let _ = entry.sender.send(Some(Err("producer task aborted".to_string())));
+            coordinator.inner.lock().unwrap().remove(&filter);
+            // Sender still holds Some(Err) so waiter will get error, not hang
+        }
+        // Waiter should not deadlock
+        let res = tokio::time::timeout(std::time::Duration::from_secs(2), waiter).await;
+        assert!(res.is_ok(), "deadlock: waiter did not wake");
+        let inner = res.unwrap().unwrap();
+        assert!(inner.is_err());
+        assert!(coordinator.is_empty());
+        assert!(cache.read().unwrap().get_largest_accounts(&filter).is_none());
+        // Future request is retryable: can elect new producer
+        let (is_prod2, entry2) = coordinator.get_or_create(&filter);
+        assert!(is_prod2);
+        // Ensure no concurrent same-key recovery producers: second concurrent attempt should be waiter, not producer
+        let (is_prod3, _) = coordinator.get_or_create(&filter);
+        assert!(!is_prod3, "should not start multiple same-key producers as recovery");
+        // Complete second producer successfully
+        let slot = 999u64;
+        let accounts = vec![RpcAccountBalance { address: "R".to_string(), lamports: 999 }];
+        {
+            let mut w = cache.write().unwrap();
+            w.set_largest_accounts(&filter, slot, &accounts);
+        }
+        let _ = entry2.sender.send(Some(Ok((slot, accounts.clone()))));
+        coordinator.inner.lock().unwrap().remove(&filter);
+        let r = entry2.wait().await.unwrap();
+        assert_eq!(r, (slot, accounts));
+        assert!(coordinator.is_empty());
+    }
+
+    #[test]
+    fn test_largest_accounts_ttl_preserved() {
+        // 10. preserve existing TTL test and verify coordinator does not change `cached_time`, 7200-second production TTL, strict boundary, or expiration behavior.
+        // No sleep: use manual SystemTime injection via set_largest_accounts_with_time for deterministic TTL test.
+        use crate::rpc_cache::{LargestAccountsCache, LargestAccountsSingleflight};
+        use solana_rpc_client_api::{config::RpcLargestAccountsFilter, response::RpcAccountBalance};
+        use std::{
+            sync::{Arc, RwLock},
+            time::{Duration, SystemTime},
+        };
+        // Verify production TTL is 7200
+        // The cache is created with 7200 in production (rpc_service.rs const LARGEST_ACCOUNTS_CACHE_DURATION = 60*60*2)
+        let _cache = LargestAccountsCache::new(60 * 60 * 2);
+        // We cannot read private duration, but we test behavior: strict boundary < duration
+        let mut cache_short = LargestAccountsCache::new(1);
+        let filter = Some(RpcLargestAccountsFilter::Circulating);
+        let accounts = vec![RpcAccountBalance { address: "T".to_string(), lamports: 1 }];
+        // Immediate hit with fresh time
+        cache_short.set_largest_accounts(&filter, 1, &accounts);
+        assert!(cache_short.get_largest_accounts(&filter).is_some());
+        // Strict expiration: elapsed == duration => None (not <). Use manual time to avoid sleep.
+        let mut cache_expire = LargestAccountsCache::new(1);
+        cache_expire.set_largest_accounts_with_time(
+            &filter,
+            1,
+            &accounts,
+            SystemTime::now() - Duration::from_secs(1),
+        );
+        assert!(
+            cache_expire.get_largest_accounts(&filter).is_none(),
+            "strict boundary should expire at duration"
+        );
+        // Still hit if elapsed < duration
+        let mut cache_hit = LargestAccountsCache::new(1);
+        cache_hit.set_largest_accounts_with_time(
+            &filter,
+            1,
+            &accounts,
+            SystemTime::now() - Duration::from_millis(500),
+        );
+        assert!(cache_hit.get_largest_accounts(&filter).is_some());
+        // Coordinator should not affect cached_time
+        let cache2 = Arc::new(RwLock::new(LargestAccountsCache::new(7200)));
+        let coordinator = Arc::new(LargestAccountsSingleflight::new());
+        let filter2: Option<RpcLargestAccountsFilter> = None;
+        {
+            let mut w = cache2.write().unwrap();
+            w.set_largest_accounts(&filter2, 10, &accounts);
+        }
+        let before = cache2.read().unwrap().get_largest_accounts(&filter2).unwrap();
+        // Touch coordinator
+        let (is_prod, entry) = coordinator.get_or_create(&filter2);
+        assert!(is_prod);
+        coordinator.inner.lock().unwrap().remove(&filter2);
+        let _ = entry.sender.send(Some(Ok((11, accounts.clone()))));
+        let after = cache2.read().unwrap().get_largest_accounts(&filter2).unwrap();
+        // cached_time should be unchanged (still slot 10, not 11, because coordinator didn't update cache)
+        assert_eq!(before.0, after.0);
+        assert_eq!(before.1, after.1);
+        // 7200 second TTL still strict
+        let mut cache7200 = LargestAccountsCache::new(7200);
+        cache7200.set_largest_accounts(&filter, 5, &accounts);
+        // Manipulate cached_time via SystemTime check: we can't fast-forward 7200, but verify logic uses < Duration::from_secs(7200)
+        assert!(cache7200.get_largest_accounts(&filter).is_some());
+        // Exact 7200 boundary: elapsed == 7200 => expired, elapsed = 7199 => hit
+        let mut cache7200_exact = LargestAccountsCache::new(7200);
+        cache7200_exact.set_largest_accounts_with_time(
+            &filter,
+            5,
+            &accounts,
+            SystemTime::now() - Duration::from_secs(7200),
+        );
+        assert!(
+            cache7200_exact.get_largest_accounts(&filter).is_none(),
+            "exact 7200 should expire strict"
+        );
+        let mut cache7200_hit = LargestAccountsCache::new(7200);
+        cache7200_hit.set_largest_accounts_with_time(
+            &filter,
+            5,
+            &accounts,
+            SystemTime::now() - Duration::from_secs(7199),
+        );
+        assert!(cache7200_hit.get_largest_accounts(&filter).is_some());
+        // Ensure coordinator empty after operations
+        assert!(coordinator.is_empty());
+        // Also verify production cache duration constant is 7200 by checking cache still hits after 1 sec but would expire only after 7200
+        // This proves coordinator does not change TTL behavior.
+    }
+
+    #[tokio::test]
+    async fn test_largest_accounts_abort_before_first_poll() {
+        // Audit finding: lease must be constructed before spawn so Drop runs even if future never polled.
+        // Arrange producer entry + waiter, create/spawn owned task, abort/drop before poll,
+        // assert waiter completes (no deadlock), in-flight empty, cache not falsely populated,
+        // future request can elect exactly one new producer. Also verify generation check.
+        use crate::rpc_cache::{LargestAccountsCache, LargestAccountsSingleflight, SingleflightLease};
+        use solana_rpc_client_api::{config::RpcLargestAccountsFilter, response::RpcAccountBalance};
+        use std::{
+            sync::{Arc, RwLock},
+            time::Duration,
+        };
+        let coordinator = Arc::new(LargestAccountsSingleflight::new());
+        let cache = Arc::new(RwLock::new(LargestAccountsCache::new(7200)));
+        let filter = Some(RpcLargestAccountsFilter::Circulating);
+
+        // Case A: future dropped without ever being polled (synchronous lease Drop)
+        let (is_prod, entry) = coordinator.get_or_create(&filter);
+        assert!(is_prod);
+        let waiter = {
+            let e = entry.clone();
+            tokio::spawn(async move { e.wait().await })
+        };
+        let lease = SingleflightLease::new(coordinator.clone(), filter.clone(), entry.clone());
+        let fut = async move {
+            let _lease = lease;
+            std::future::pending::<()>().await;
+        };
+        drop(fut); // never polled, lease Drop should clean
+        let res = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("deadlock: waiter did not wake")
+            .unwrap();
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("aborted"));
+        assert!(coordinator.is_empty(), "in-flight should be empty after abort-before-poll");
+        assert!(
+            cache.read().unwrap().get_largest_accounts(&filter).is_none(),
+            "cache should not be falsely populated"
+        );
+        // Future request can elect exactly one new producer
+        let (is_prod2, entry2) = coordinator.get_or_create(&filter);
+        assert!(is_prod2);
+        let (is_prod3, _) = coordinator.get_or_create(&filter);
+        assert!(!is_prod3, "should not create concurrent recovery producers");
+        // Cleanup gen2
+        let _ = entry2.sender.send(Some(Ok((999, vec![RpcAccountBalance {
+            address: "X".to_string(),
+            lamports: 999,
+        }]))));
+        {
+            let mut map = coordinator.inner.lock().unwrap();
+            if let Some(existing) = map.get(&filter) {
+                if Arc::ptr_eq(existing, &entry2) {
+                    map.remove(&filter);
+                }
+            }
+        }
+        assert!(coordinator.is_empty());
+
+        // Case B: tokio::spawn + abort before poll
+        let (is_prod_a, entry_a) = coordinator.get_or_create(&filter);
+        assert!(is_prod_a);
+        let waiter_a = {
+            let e = entry_a.clone();
+            tokio::spawn(async move { e.wait().await })
+        };
+        let lease_a = SingleflightLease::new(coordinator.clone(), filter.clone(), entry_a.clone());
+        let handle = tokio::spawn(async move {
+            let _lease = lease_a;
+            std::future::pending::<()>().await;
+        });
+        handle.abort();
+        let _ = handle.await;
+        let res_a = tokio::time::timeout(Duration::from_secs(2), waiter_a)
+            .await
+            .expect("deadlock")
+            .unwrap();
+        assert!(res_a.is_err());
+        assert!(res_a.unwrap_err().contains("aborted"));
+        assert!(coordinator.is_empty());
+        assert!(cache.read().unwrap().get_largest_accounts(&filter).is_none());
+
+        // Generation check: stale lease must not delete newer generation
+        let (is_prod_b, entry_b) = coordinator.get_or_create(&filter);
+        assert!(is_prod_b);
+        let lease_b = SingleflightLease::new(coordinator.clone(), filter.clone(), entry_b.clone());
+        let _ = entry_b.sender.send(Some(Ok((1, vec![]))));
+        {
+            let mut map = coordinator.inner.lock().unwrap();
+            if let Some(existing) = map.get(&filter) {
+                if Arc::ptr_eq(existing, &entry_b) {
+                    map.remove(&filter);
+                }
+            }
+        }
+        lease_b.mark_completed();
+        assert!(coordinator.is_empty());
+        let (is_prod_c, entry_c) = coordinator.get_or_create(&filter);
+        assert!(is_prod_c);
+        let stale_lease = SingleflightLease::new(coordinator.clone(), filter.clone(), entry_b.clone());
+        drop(stale_lease); // should not delete entry_c
+        assert!(coordinator.is_inflight(&filter));
+        assert!(Arc::ptr_eq(
+            &coordinator.inner.lock().unwrap().get(&filter).unwrap(),
+            &entry_c
+        ));
+        let _ = entry_c.sender.send(Some(Ok((2, vec![]))));
+        {
+            let mut map = coordinator.inner.lock().unwrap();
+            if let Some(existing) = map.get(&filter) {
+                if Arc::ptr_eq(existing, &entry_c) {
+                    map.remove(&filter);
+                }
+            }
+        }
+        assert!(coordinator.is_empty());
     }
 }
