@@ -45,7 +45,7 @@ use {
         leader_schedule_cache::LeaderScheduleCache,
     },
     solana_message::{AddressLoader, SanitizedMessage},
-    solana_metrics::inc_new_counter_info,
+    solana_metrics::{ScanOrigin, inc_new_counter_info},
     solana_perf::packet::PACKET_DATA_SIZE,
     solana_program_pack::Pack,
     solana_pubkey::{PUBKEY_BYTES, Pubkey},
@@ -295,10 +295,11 @@ impl JsonRpcRequestProcessor {
     async fn calculate_non_circulating_supply(
         &self,
         bank: &Arc<Bank>,
+        origin: ScanOrigin,
     ) -> ScanResult<NonCirculatingSupply> {
         let bank = Arc::clone(bank);
         self.runtime
-            .spawn_blocking(move || calculate_non_circulating_supply(&bank))
+            .spawn_blocking(move || calculate_non_circulating_supply(&bank, origin))
             .await
             .expect("Failed to spawn blocking task")
     }
@@ -310,6 +311,7 @@ impl JsonRpcRequestProcessor {
         program_id: &Pubkey,
         filters: Vec<RpcFilterType>,
         sort_results: bool,
+        origin: ScanOrigin,
     ) -> ScanResult<Vec<KeyedAccountSharedData>> {
         let bank = Arc::clone(bank);
         let index_key = index_key.to_owned();
@@ -332,6 +334,7 @@ impl JsonRpcRequestProcessor {
                                 .all(|filter_type| filter_allows(filter_type, account))
                     },
                     byte_limit_for_scans,
+                    origin,
                 )
             })
             .await
@@ -631,6 +634,7 @@ impl JsonRpcRequestProcessor {
                     owner,
                     filters,
                     sort_results,
+                    ScanOrigin::GetProgramAccounts,
                 )
                 .await?
             } else if let Some(mint) = get_spl_token_mint_filter(&program_id, &filters)? {
@@ -640,6 +644,7 @@ impl JsonRpcRequestProcessor {
                     mint,
                     filters,
                     sort_results,
+                    ScanOrigin::GetProgramAccounts,
                 )
                 .await?
             } else {
@@ -648,6 +653,7 @@ impl JsonRpcRequestProcessor {
                     program_id,
                     filters,
                     sort_results,
+                    ScanOrigin::GetProgramAccounts,
                 )
                 .await?
             }
@@ -1082,7 +1088,7 @@ impl JsonRpcRequestProcessor {
         } else {
             let (addresses, address_filter) = if let Some(filter) = config.clone().filter {
                 let non_circulating_supply = self
-                    .calculate_non_circulating_supply(&bank)
+                    .calculate_non_circulating_supply(&bank, ScanOrigin::GetLargestAccounts)
                     .await
                     .map_err(|e| RpcCustomError::ScanError {
                         message: e.to_string(),
@@ -1101,7 +1107,12 @@ impl JsonRpcRequestProcessor {
                 .spawn_blocking({
                     let bank = Arc::clone(&bank);
                     move || {
-                        bank.get_largest_accounts(NUM_LARGEST_ACCOUNTS, &addresses, address_filter)
+                        bank.get_largest_accounts(
+                            NUM_LARGEST_ACCOUNTS,
+                            &addresses,
+                            address_filter,
+                            ScanOrigin::GetLargestAccounts,
+                        )
                     }
                 })
                 .await
@@ -1127,12 +1138,12 @@ impl JsonRpcRequestProcessor {
     ) -> RpcCustomResult<RpcResponse<RpcSupply>> {
         let config = config.unwrap_or_default();
         let bank = self.bank(config.commitment);
-        let non_circulating_supply =
-            self.calculate_non_circulating_supply(&bank)
-                .await
-                .map_err(|e| RpcCustomError::ScanError {
-                    message: e.to_string(),
-                })?;
+        let non_circulating_supply = self
+            .calculate_non_circulating_supply(&bank, ScanOrigin::GetSupply)
+            .await
+            .map_err(|e| RpcCustomError::ScanError {
+                message: e.to_string(),
+            })?;
         let total_supply = bank.capitalization();
         let non_circulating_accounts = if config.exclude_non_circulating_accounts_list {
             vec![]
@@ -2098,6 +2109,7 @@ impl JsonRpcRequestProcessor {
                 mint,
                 vec![],
                 true,
+                ScanOrigin::GetTokenLargestAccounts,
             )
             .await?
         {
@@ -2168,6 +2180,7 @@ impl JsonRpcRequestProcessor {
                 owner,
                 filters,
                 sort_results,
+                ScanOrigin::GetTokenAccountsByOwner,
             )
             .await?;
         let accounts = if encoding == UiAccountEncoding::JsonParsed {
@@ -2223,6 +2236,7 @@ impl JsonRpcRequestProcessor {
                 mint,
                 filters,
                 sort_results,
+                ScanOrigin::GetTokenAccountsByDelegate,
             )
             .await?
         } else {
@@ -2233,6 +2247,7 @@ impl JsonRpcRequestProcessor {
                 token_program_id,
                 filters,
                 sort_results,
+                ScanOrigin::GetTokenAccountsByDelegate,
             )
             .await?
         };
@@ -2260,6 +2275,7 @@ impl JsonRpcRequestProcessor {
         program_id: Pubkey,
         mut filters: Vec<RpcFilterType>,
         sort_results: bool,
+        origin: ScanOrigin,
     ) -> RpcCustomResult<Vec<(Pubkey, AccountSharedData)>> {
         optimize_filters(&mut filters);
         if self
@@ -2278,6 +2294,7 @@ impl JsonRpcRequestProcessor {
                 &program_id,
                 filters,
                 sort_results,
+                origin,
             )
             .await
             .map_err(|e| RpcCustomError::ScanError {
@@ -2295,6 +2312,7 @@ impl JsonRpcRequestProcessor {
                                 .iter()
                                 .all(|filter_type| filter_allows(filter_type, account))
                         },
+                        origin,
                     )
                     .map_err(|e| RpcCustomError::ScanError {
                         message: e.to_string(),
@@ -2318,6 +2336,7 @@ impl JsonRpcRequestProcessor {
         owner_key: Pubkey,
         mut filters: Vec<RpcFilterType>,
         sort_results: bool,
+        origin: ScanOrigin,
     ) -> RpcCustomResult<Vec<(Pubkey, AccountSharedData)>> {
         // The by-owner accounts index checks for Token Account state and Owner address on
         // inclusion. However, due to the current AccountsDb implementation, an account may remain
@@ -2348,13 +2367,14 @@ impl JsonRpcRequestProcessor {
                 &program_id,
                 filters,
                 sort_results,
+                origin,
             )
             .await
             .map_err(|e| RpcCustomError::ScanError {
                 message: e.to_string(),
             })
         } else {
-            self.get_filtered_program_accounts(bank, program_id, filters, sort_results)
+            self.get_filtered_program_accounts(bank, program_id, filters, sort_results, origin)
                 .await
         }
     }
@@ -2367,6 +2387,7 @@ impl JsonRpcRequestProcessor {
         mint_key: Pubkey,
         mut filters: Vec<RpcFilterType>,
         sort_results: bool,
+        origin: ScanOrigin,
     ) -> RpcCustomResult<Vec<(Pubkey, AccountSharedData)>> {
         // The by-mint accounts index checks for Token Account state and Mint address on inclusion.
         // However, due to the current AccountsDb implementation, an account may remain in storage
@@ -2396,13 +2417,14 @@ impl JsonRpcRequestProcessor {
                 &program_id,
                 filters,
                 sort_results,
+                origin,
             )
             .await
             .map_err(|e| RpcCustomError::ScanError {
                 message: e.to_string(),
             })
         } else {
-            self.get_filtered_program_accounts(bank, program_id, filters, sort_results)
+            self.get_filtered_program_accounts(bank, program_id, filters, sort_results, origin)
                 .await
         }
     }

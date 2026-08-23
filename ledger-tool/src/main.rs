@@ -57,6 +57,7 @@ use {
         shred::{ProcessShredsStats, ReedSolomonCache, Shred, Shredder},
     },
     solana_measure::{measure::Measure, measure_time},
+    solana_metrics::ScanOrigin,
     solana_message::SimpleAddressLoader,
     solana_native_token::{LAMPORTS_PER_SOL, Sol},
     solana_pubkey::Pubkey,
@@ -2256,7 +2257,10 @@ fn main() {
 
                     if remove_stake_accounts {
                         for (address, mut account) in bank
-                            .get_program_accounts(&stake::program::id())
+                            .get_program_accounts(
+                                &stake::program::id(),
+                                ScanOrigin::LedgerToolGetProgramAccounts,
+                            )
                             .unwrap()
                             .into_iter()
                         {
@@ -2280,7 +2284,10 @@ fn main() {
 
                     if !vote_accounts_to_destake.is_empty() {
                         for (address, mut account) in bank
-                            .get_program_accounts(&stake::program::id())
+                            .get_program_accounts(
+                                &stake::program::id(),
+                                ScanOrigin::LedgerToolGetProgramAccounts,
+                            )
                             .unwrap()
                             .into_iter()
                         {
@@ -2317,7 +2324,10 @@ fn main() {
 
                         // Delete existing vote accounts
                         for (address, mut account) in bank
-                            .get_program_accounts(&solana_vote_program::id())
+                            .get_program_accounts(
+                                &solana_vote_program::id(),
+                                ScanOrigin::LedgerToolGetProgramAccounts,
+                            )
                             .unwrap()
                             .into_iter()
                         {

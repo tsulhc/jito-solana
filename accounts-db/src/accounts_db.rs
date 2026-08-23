@@ -77,6 +77,7 @@ use {
     solana_epoch_schedule::EpochSchedule,
     solana_lattice_hash::lt_hash::LtHash,
     solana_measure::{measure::Measure, measure_us},
+    solana_metrics::ScanOrigin,
     solana_nohash_hasher::{BuildNoHashHasher, IntMap, IntSet},
     solana_pubkey::{Pubkey, PubkeyHasherBuilder},
     solana_rayon_threadlimit::get_thread_count,
@@ -3428,16 +3429,19 @@ impl AccountsDb {
         bank_id: BankId,
         mut scan_func: F,
         config: &ScanConfig,
+        origin: ScanOrigin,
     ) -> ScanResult<()>
     where
         F: FnMut(Option<(&Pubkey, AccountSharedData, Slot)>),
     {
         // Register this scan so that slots needed by the scan are not cleaned out from under us.
-        let scan_guard = ScanGuard::try_new(&self.scan_tracker, bank_id, || self.max_root())
-            .ok_or(ScanError::SlotRemoved {
-                slot: ancestors.max_slot(),
-                bank_id,
-            })?;
+        let scan_guard =
+            ScanGuard::try_new(&self.scan_tracker, bank_id, || self.max_root(), origin).ok_or(
+                ScanError::SlotRemoved {
+                    slot: ancestors.max_slot(),
+                    bank_id,
+                },
+            )?;
 
         // If the scan's ancestors are all rooted, drop them and scan roots only
         // Scan Guard max root must be used as the scan guard guarantees that
@@ -3524,6 +3528,7 @@ impl AccountsDb {
         index_key: IndexKey,
         mut scan_func: F,
         config: &ScanConfig,
+        origin: ScanOrigin,
     ) -> ScanResult<bool>
     where
         F: FnMut(Option<(&Pubkey, AccountSharedData, Slot)>),
@@ -3536,16 +3541,18 @@ impl AccountsDb {
         if !self.account_indexes.include_key(key) {
             // the requested key was not indexed in the secondary index, so do a normal scan
             let used_index = false;
-            self.scan_accounts(ancestors, bank_id, scan_func, config)?;
+            self.scan_accounts(ancestors, bank_id, scan_func, config, origin)?;
             return Ok(used_index);
         }
 
         // Register this scan so that slots needed by the scan are not cleaned out from under us.
-        let scan_guard = ScanGuard::try_new(&self.scan_tracker, bank_id, || self.max_root())
-            .ok_or(ScanError::SlotRemoved {
-                slot: ancestors.max_slot(),
-                bank_id,
-            })?;
+        let scan_guard =
+            ScanGuard::try_new(&self.scan_tracker, bank_id, || self.max_root(), origin).ok_or(
+                ScanError::SlotRemoved {
+                    slot: ancestors.max_slot(),
+                    bank_id,
+                },
+            )?;
 
         // If the scan's ancestors are all rooted, drop them and scan roots only
         // Scan Guard max root must be used as the scan guard guarantees that

@@ -563,11 +563,12 @@ pub enum SupplyCalcError {
 async fn calculate_circulating_supply_async(bank: &Arc<Bank>) -> Result<u64, SupplyCalcError> {
     let total_supply = bank.capitalization();
     let bank = Arc::clone(bank);
-    let non_circulating_supply =
-        tokio::task::spawn_blocking(move || calculate_non_circulating_supply(&bank))
-            .await
-            .expect("Failed to spawn blocking task")
-            .map_err(|e| SupplyCalcError::Scan(e.to_string()))?;
+    let non_circulating_supply = tokio::task::spawn_blocking(move || {
+        calculate_non_circulating_supply(&bank, solana_metrics::ScanOrigin::CirculatingSupply)
+    })
+    .await
+    .expect("Failed to spawn blocking task")
+    .map_err(|e| SupplyCalcError::Scan(e.to_string()))?;
 
     Ok(total_supply.saturating_sub(non_circulating_supply.lamports))
 }

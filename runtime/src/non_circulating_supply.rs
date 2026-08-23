@@ -6,6 +6,7 @@ use {
         accounts_index::{AccountIndex, IndexKey},
         accounts_scan::ScanResult,
     },
+    solana_metrics::ScanOrigin,
     solana_pubkey::Pubkey,
     solana_stake_interface::{self as stake, state::StakeStateV2},
     std::collections::HashSet,
@@ -16,7 +17,10 @@ pub struct NonCirculatingSupply {
     pub accounts: Vec<Pubkey>,
 }
 
-pub fn calculate_non_circulating_supply(bank: &Bank) -> ScanResult<NonCirculatingSupply> {
+pub fn calculate_non_circulating_supply(
+    bank: &Bank,
+    origin: ScanOrigin,
+) -> ScanResult<NonCirculatingSupply> {
     debug!("Updating Bank supply, epoch: {}", bank.epoch());
     let mut non_circulating_accounts_set: HashSet<Pubkey> = HashSet::new();
 
@@ -41,9 +45,10 @@ pub fn calculate_non_circulating_supply(bank: &Bank) -> ScanResult<NonCirculatin
             // updates. We include the redundant filter here to avoid returning these accounts.
             |account| account.owner() == &stake::program::id(),
             None,
+            origin,
         )?
     } else {
-        bank.get_program_accounts(&stake::program::id())?
+        bank.get_program_accounts(&stake::program::id(), origin)?
     };
 
     for (pubkey, account) in stake_accounts.iter() {
@@ -501,7 +506,8 @@ mod tests {
                 + genesis_sysvar_and_builtin_program_lamports(),
         );
 
-        let non_circulating_supply = calculate_non_circulating_supply(&bank).unwrap();
+        let non_circulating_supply =
+            calculate_non_circulating_supply(&bank, ScanOrigin::Other).unwrap();
         assert_eq!(
             non_circulating_supply.lamports,
             (num_non_circulating_accounts + num_stake_accounts) * balance
@@ -519,7 +525,8 @@ mod tests {
                 &AccountSharedData::new(new_balance, 0, &Pubkey::default()),
             );
         }
-        let non_circulating_supply = calculate_non_circulating_supply(&bank).unwrap();
+        let non_circulating_supply =
+            calculate_non_circulating_supply(&bank, ScanOrigin::Other).unwrap();
         assert_eq!(
             non_circulating_supply.lamports,
             (num_non_circulating_accounts * new_balance) + (num_stake_accounts * balance)
@@ -534,7 +541,8 @@ mod tests {
             bank = new_from_parent(bank, &bank_forks);
         }
         assert_eq!(bank.epoch(), 1);
-        let non_circulating_supply = calculate_non_circulating_supply(&bank).unwrap();
+        let non_circulating_supply =
+            calculate_non_circulating_supply(&bank, ScanOrigin::Other).unwrap();
         assert_eq!(
             non_circulating_supply.lamports,
             num_non_circulating_accounts * new_balance

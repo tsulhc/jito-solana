@@ -10362,6 +10362,7 @@ dependencies = [
  "symlink",
  "test-case",
  "thiserror 2.0.18",
+ "tikv-jemalloc-ctl",
  "tokio",
  "tokio-util 0.7.18",
  "wincode",

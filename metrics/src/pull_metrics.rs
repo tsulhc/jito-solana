@@ -11,6 +11,55 @@ use std::{
 /// The number of method slots reserved for RPC instrumentation.
 pub const RPC_METHOD_SLOTS: usize = 54;
 
+/// Static semantic origins for account scans.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScanOrigin {
+    GetProgramAccounts,
+    GetLargestAccounts,
+    GetSupply,
+    GetTokenAccountsByOwner,
+    GetTokenAccountsByDelegate,
+    GetTokenLargestAccounts,
+    CirculatingSupply,
+    AccountsDataSizeCalculation,
+    LedgerToolScanAll,
+    LedgerToolGetProgramAccounts,
+    Other,
+}
+
+pub const SCAN_ORIGIN_SLOTS: usize = 11;
+pub const SCAN_ORIGIN_LABELS: [&str; SCAN_ORIGIN_SLOTS] = [
+    "get_program_accounts",
+    "get_largest_accounts",
+    "get_supply",
+    "get_token_accounts_by_owner",
+    "get_token_accounts_by_delegate",
+    "get_token_largest_accounts",
+    "circulating_supply",
+    "accounts_data_size_calculation",
+    "ledger_tool_scan_all",
+    "ledger_tool_get_program_accounts",
+    "other",
+];
+
+impl ScanOrigin {
+    pub const fn slot(self) -> usize {
+        match self {
+            Self::GetProgramAccounts => 0,
+            Self::GetLargestAccounts => 1,
+            Self::GetSupply => 2,
+            Self::GetTokenAccountsByOwner => 3,
+            Self::GetTokenAccountsByDelegate => 4,
+            Self::GetTokenLargestAccounts => 5,
+            Self::CirculatingSupply => 6,
+            Self::AccountsDataSizeCalculation => 7,
+            Self::LedgerToolScanAll => 8,
+            Self::LedgerToolGetProgramAccounts => 9,
+            Self::Other => 10,
+        }
+    }
+}
+
 const RPC_METHOD_LABELS: [&str; RPC_METHOD_SLOTS] = [
     "getBalance",
     "getEpochInfo",
@@ -83,6 +132,9 @@ pub struct PullMetrics {
     accounts_scan_started_total: AtomicU64,
     accounts_scan_completed_total: AtomicU64,
     accounts_scan_max_root_distance: AtomicU64,
+    scan_origin_active: [AtomicU64; SCAN_ORIGIN_SLOTS],
+    scan_origin_started: [AtomicU64; SCAN_ORIGIN_SLOTS],
+    scan_origin_completed: [AtomicU64; SCAN_ORIGIN_SLOTS],
     pub jemalloc_allocated_bytes: AtomicU64,
     pub jemalloc_resident_bytes: AtomicU64,
     pub jemalloc_active_bytes: AtomicU64,
@@ -104,6 +156,9 @@ impl Default for PullMetrics {
             accounts_scan_started_total: AtomicU64::new(0),
             accounts_scan_completed_total: AtomicU64::new(0),
             accounts_scan_max_root_distance: AtomicU64::new(0),
+            scan_origin_active: std::array::from_fn(|_| AtomicU64::new(0)),
+            scan_origin_started: std::array::from_fn(|_| AtomicU64::new(0)),
+            scan_origin_completed: std::array::from_fn(|_| AtomicU64::new(0)),
             jemalloc_allocated_bytes: AtomicU64::new(0),
             jemalloc_resident_bytes: AtomicU64::new(0),
             jemalloc_active_bytes: AtomicU64::new(0),
@@ -118,13 +173,15 @@ impl Default for PullMetrics {
 }
 
 impl PullMetrics {
-    pub fn record_accounts_scan_start(&self) {
+    pub fn record_accounts_scan_start(&self, origin: ScanOrigin) {
         self.accounts_scan_active.fetch_add(1, Ordering::Relaxed);
         self.accounts_scan_started_total
             .fetch_add(1, Ordering::Relaxed);
+        self.scan_origin_active[origin.slot()].fetch_add(1, Ordering::Relaxed);
+        self.scan_origin_started[origin.slot()].fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn record_accounts_scan_complete(&self) {
+    pub fn record_accounts_scan_complete(&self, origin: ScanOrigin) {
         let _ =
             self.accounts_scan_active
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -132,6 +189,12 @@ impl PullMetrics {
                 });
         self.accounts_scan_completed_total
             .fetch_add(1, Ordering::Relaxed);
+        let _ = self.scan_origin_active[origin.slot()].fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |value| value.checked_sub(1),
+        );
+        self.scan_origin_completed[origin.slot()].fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_accounts_scan_root_distance(&self, distance: u64) {
@@ -225,6 +288,37 @@ impl PullMetrics {
             "agave_accounts_scan_max_root_distance",
             self.accounts_scan_max_root_distance
         );
+        for (slot, label) in SCAN_ORIGIN_LABELS.iter().enumerate() {
+            output.push_str("agave_accounts_scan_origin_active{origin=\"");
+            output.push_str(label);
+            output.push_str("\"} ");
+            output.push_str(
+                &self.scan_origin_active[slot]
+                    .load(Ordering::Relaxed)
+                    .to_string(),
+            );
+            output.push('\n');
+
+            output.push_str("agave_accounts_scan_origin_started_total{origin=\"");
+            output.push_str(label);
+            output.push_str("\"} ");
+            output.push_str(
+                &self.scan_origin_started[slot]
+                    .load(Ordering::Relaxed)
+                    .to_string(),
+            );
+            output.push('\n');
+
+            output.push_str("agave_accounts_scan_origin_completed_total{origin=\"");
+            output.push_str(label);
+            output.push_str("\"} ");
+            output.push_str(
+                &self.scan_origin_completed[slot]
+                    .load(Ordering::Relaxed)
+                    .to_string(),
+            );
+            output.push('\n');
+        }
         gauge!(
             "agave_jemalloc_allocated_bytes",
             self.jemalloc_allocated_bytes
@@ -297,15 +391,113 @@ mod tests {
     #[test]
     fn scan_lifecycle_is_live_and_balanced() {
         let metrics = PullMetrics::default();
-        metrics.record_accounts_scan_start();
-        metrics.record_accounts_scan_start();
+        metrics.record_accounts_scan_start(ScanOrigin::GetProgramAccounts);
+        metrics.record_accounts_scan_start(ScanOrigin::GetLargestAccounts);
         metrics.record_accounts_scan_root_distance(7);
-        metrics.record_accounts_scan_complete();
+        metrics.record_accounts_scan_complete(ScanOrigin::GetProgramAccounts);
         let output = metrics.exposition();
         assert!(output.contains("agave_accounts_scan_active 1\n"));
         assert!(output.contains("agave_accounts_scan_started_total 2\n"));
         assert!(output.contains("agave_accounts_scan_completed_total 1\n"));
         assert!(output.contains("agave_accounts_scan_max_root_distance 7\n"));
+        assert!(
+            output
+                .contains("agave_accounts_scan_origin_active{origin=\"get_program_accounts\"} 0\n")
+        );
+        assert!(output.contains(
+            "agave_accounts_scan_origin_started_total{origin=\"get_largest_accounts\"} 1\n"
+        ));
+        assert!(output.contains(
+            "agave_accounts_scan_origin_completed_total{origin=\"get_program_accounts\"} 1\n"
+        ));
+    }
+
+    #[test]
+    fn scan_origin_aggregates_are_balanced_and_bounded() {
+        let metrics = PullMetrics::default();
+        metrics.record_accounts_scan_start(ScanOrigin::GetProgramAccounts);
+        metrics.record_accounts_scan_start(ScanOrigin::GetLargestAccounts);
+        metrics.record_accounts_scan_complete(ScanOrigin::GetProgramAccounts);
+
+        assert_eq!(metrics.accounts_scan_active.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics.accounts_scan_started_total.load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            metrics
+                .accounts_scan_completed_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        let active_sum: u64 = metrics
+            .scan_origin_active
+            .iter()
+            .map(|value| value.load(Ordering::Relaxed))
+            .sum();
+        let started_sum: u64 = metrics
+            .scan_origin_started
+            .iter()
+            .map(|value| value.load(Ordering::Relaxed))
+            .sum();
+        let completed_sum: u64 = metrics
+            .scan_origin_completed
+            .iter()
+            .map(|value| value.load(Ordering::Relaxed))
+            .sum();
+        assert_eq!(
+            active_sum,
+            metrics.accounts_scan_active.load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            started_sum,
+            metrics.accounts_scan_started_total.load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            completed_sum,
+            metrics
+                .accounts_scan_completed_total
+                .load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            metrics.scan_origin_active[ScanOrigin::GetProgramAccounts.slot()]
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            metrics.scan_origin_active[ScanOrigin::GetLargestAccounts.slot()]
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(SCAN_ORIGIN_SLOTS, SCAN_ORIGIN_LABELS.len());
+        assert_eq!(
+            SCAN_ORIGIN_LABELS
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            SCAN_ORIGIN_SLOTS
+        );
+    }
+
+    #[test]
+    fn scan_origin_completion_does_not_underflow() {
+        let metrics = PullMetrics::default();
+        metrics.record_accounts_scan_complete(ScanOrigin::Other);
+        assert_eq!(metrics.accounts_scan_active.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics.scan_origin_active[ScanOrigin::Other.slot()].load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            metrics
+                .accounts_scan_completed_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics.scan_origin_completed[ScanOrigin::Other.slot()].load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]

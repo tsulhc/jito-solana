@@ -5,7 +5,9 @@ pub mod datapoint;
 pub mod metrics;
 pub mod pull_metrics;
 pub use crate::metrics::{flush, set_host_id, set_panic_hook, submit};
-pub use crate::pull_metrics::{PullMetrics, RPC_METHOD_SLOTS};
+pub use crate::pull_metrics::{
+    PullMetrics, RPC_METHOD_SLOTS, SCAN_ORIGIN_LABELS, SCAN_ORIGIN_SLOTS, ScanOrigin,
+};
 use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicU64, Ordering},
