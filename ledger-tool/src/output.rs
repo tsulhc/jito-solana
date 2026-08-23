@@ -30,6 +30,7 @@ use {
         blockstore_meta::{DuplicateSlotProof, ErasureMeta},
         shred::{Shred, ShredType},
     },
+    solana_metrics::ScanOrigin,
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
     solana_signer_store::{Decoded, decode},
@@ -1238,7 +1239,9 @@ impl AccountsScanner {
 
         match &self.config.mode {
             AccountsOutputMode::All => {
-                self.bank.scan_all_accounts(scan_func).unwrap();
+                self.bank
+                    .scan_all_accounts(scan_func, ScanOrigin::LedgerToolScanAll)
+                    .unwrap();
             }
             AccountsOutputMode::Individual(pubkeys) => pubkeys.iter().for_each(|pubkey| {
                 if let Some((account, _slot)) = self
@@ -1252,7 +1255,7 @@ impl AccountsScanner {
             }),
             AccountsOutputMode::Program(program_pubkey) => self
                 .bank
-                .get_program_accounts(program_pubkey)
+                .get_program_accounts(program_pubkey, ScanOrigin::LedgerToolGetProgramAccounts)
                 .unwrap()
                 .iter()
                 .filter(|(_, account)| self.should_process_account(account))
