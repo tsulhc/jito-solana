@@ -331,8 +331,21 @@ impl Accounts {
         program_id: &Pubkey,
         origin: ScanOrigin,
     ) -> ScanResult<Vec<KeyedAccountSharedData>> {
+        self.load_by_program_with_abort(ancestors, bank_id, program_id, None, origin)
+    }
+
+    pub fn load_by_program_with_abort(
+        &self,
+        ancestors: &Ancestors,
+        bank_id: BankId,
+        program_id: &Pubkey,
+        abort: Option<Arc<AtomicBool>>,
+        origin: ScanOrigin,
+    ) -> ScanResult<Vec<KeyedAccountSharedData>> {
         let mut collector = Vec::new();
-        self.accounts_db
+        let config = ScanConfig { abort };
+        let result = self
+            .accounts_db
             .scan_accounts(
                 ancestors,
                 bank_id,
@@ -341,10 +354,15 @@ impl Accounts {
                         account.owner() == program_id
                     })
                 },
-                &ScanConfig::default(),
+                &config,
                 origin,
             )
-            .map(|_| collector)
+            .map(|_| collector);
+        if config.is_aborted() {
+            Err(ScanError::Aborted("account scan aborted".to_string()))
+        } else {
+            result
+        }
     }
 
     pub fn load_by_program_with_filter<F: Fn(&AccountSharedData) -> bool>(
@@ -394,17 +412,28 @@ impl Accounts {
         }
     }
 
+    fn maybe_abort_scan_with_byte_limit(
+        result: ScanResult<Vec<KeyedAccountSharedData>>,
+        config: &ScanConfig,
+        byte_limit_exceeded: &AtomicBool,
+    ) -> ScanResult<Vec<KeyedAccountSharedData>> {
+        if byte_limit_exceeded.load(Ordering::Relaxed) {
+            ScanResult::Err(ScanError::Aborted(
+                "The accumulated scan results exceeded the limit".to_string(),
+            ))
+        } else if config.is_aborted() {
+            ScanResult::Err(ScanError::Aborted("account scan aborted".to_string()))
+        } else {
+            result
+        }
+    }
+
+    #[cfg(test)]
     fn maybe_abort_scan(
         result: ScanResult<Vec<KeyedAccountSharedData>>,
         config: &ScanConfig,
     ) -> ScanResult<Vec<KeyedAccountSharedData>> {
-        if config.is_aborted() {
-            ScanResult::Err(ScanError::Aborted(
-                "The accumulated scan results exceeded the limit".to_string(),
-            ))
-        } else {
-            result
-        }
+        Self::maybe_abort_scan_with_byte_limit(result, config, &AtomicBool::new(false))
     }
 
     pub fn load_by_index_key_with_filter<F: Fn(&AccountSharedData) -> bool>(
@@ -416,9 +445,35 @@ impl Accounts {
         byte_limit_for_scan: Option<usize>,
         origin: ScanOrigin,
     ) -> ScanResult<Vec<KeyedAccountSharedData>> {
+        self.load_by_index_key_with_filter_with_abort(
+            ancestors,
+            bank_id,
+            index_key,
+            filter,
+            byte_limit_for_scan,
+            None,
+            origin,
+        )
+    }
+
+    pub fn load_by_index_key_with_filter_with_abort<F: Fn(&AccountSharedData) -> bool>(
+        &self,
+        ancestors: &Ancestors,
+        bank_id: BankId,
+        index_key: &IndexKey,
+        filter: F,
+        byte_limit_for_scan: Option<usize>,
+        abort: Option<Arc<AtomicBool>>,
+        origin: ScanOrigin,
+    ) -> ScanResult<Vec<KeyedAccountSharedData>> {
         let sum = AtomicUsize::default();
-        let config = ScanConfig::default().recreate_with_abort();
+        let byte_limit_exceeded = Arc::new(AtomicBool::new(false));
+        let config = match abort {
+            Some(abort) => ScanConfig { abort: Some(abort) },
+            None => ScanConfig::default().recreate_with_abort(),
+        };
         let mut collector = Vec::new();
+        let byte_limit_exceeded_for_callback = Arc::clone(&byte_limit_exceeded);
         let result = self
             .accounts_db
             .index_scan_accounts(
@@ -436,6 +491,7 @@ impl Accounts {
                             )
                         {
                             // total size of results exceeds size limit, so abort scan
+                            byte_limit_exceeded_for_callback.store(true, Ordering::Relaxed);
                             config.abort();
                         }
                         use_account
@@ -445,7 +501,7 @@ impl Accounts {
                 origin,
             )
             .map(|_| collector);
-        Self::maybe_abort_scan(result, &config)
+        Self::maybe_abort_scan_with_byte_limit(result, &config, &byte_limit_exceeded)
     }
 
     pub fn account_indexes_include_key(&self, key: &Pubkey) -> bool {

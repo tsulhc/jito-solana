@@ -69,7 +69,10 @@ use {
         bank::{Bank, TransactionSimulationResult},
         bank_forks::BankForks,
         commitment::{BlockCommitmentArray, BlockCommitmentCache},
-        non_circulating_supply::{NonCirculatingSupply, calculate_non_circulating_supply},
+        non_circulating_supply::{
+            NonCirculatingSupply, calculate_non_circulating_supply,
+            calculate_non_circulating_supply_with_abort,
+        },
         prioritization_fee_cache::PrioritizationFeeCache,
         stake_utils,
     },
@@ -120,6 +123,7 @@ use {
 };
 #[cfg(test)]
 use {
+    solana_clock::BankId,
     solana_gossip::contact_info::ContactInfo,
     solana_ledger::get_tmp_ledger_path,
     solana_net_utils::SocketAddrSpace,
@@ -141,6 +145,44 @@ type RpcCustomResult<T> = std::result::Result<T, RpcCustomError>;
 
 pub const MAX_REQUEST_BODY_SIZE: usize = 50 * (1 << 10); // 50kB
 pub const PERFORMANCE_SAMPLES_LIMIT: usize = 720;
+
+#[cfg(test)]
+static LARGEST_ACCOUNTS_NON_CIRCULATING_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<(BankId, Box<dyn FnOnce(Arc<AtomicBool>) + Send>)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn install_largest_accounts_non_circulating_hook(
+    bank_id: BankId,
+    hook: Box<dyn FnOnce(Arc<AtomicBool>) + Send>,
+) {
+    let mut installed = LARGEST_ACCOUNTS_NON_CIRCULATING_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap();
+    assert!(installed.replace((bank_id, hook)).is_none());
+}
+
+#[cfg(test)]
+fn run_largest_accounts_non_circulating_hook(bank: &Bank, abort: Arc<AtomicBool>) {
+    let hook = {
+        let mut installed = LARGEST_ACCOUNTS_NON_CIRCULATING_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap();
+        if installed
+            .as_ref()
+            .is_some_and(|(bank_id, _)| *bank_id == bank.bank_id())
+        {
+            installed.take().map(|(_, hook)| hook)
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        hook(abort);
+    }
+}
 
 fn new_response<T>(bank: &Bank, value: T) -> RpcResponse<T> {
     RpcResponse {
@@ -1169,12 +1211,20 @@ impl JsonRpcRequestProcessor {
                     // Execute exactly the existing miss path using the first request's already-selected Bank and filter.
                     let compute_result: std::result::Result<(u64, Vec<RpcAccountBalance>), String> =
                         async {
+                            let abort = entry_clone.abort_token();
                             let (addresses, address_filter) = if let Some(ref filter) = filter_clone
                             {
                                 let bank_for_calc = Arc::clone(&bank_clone);
+                                let non_circulating_abort = Arc::clone(&abort);
                                 let non_circulating = tokio::task::spawn_blocking(move || {
-                                    calculate_non_circulating_supply(
+                                    #[cfg(test)]
+                                    run_largest_accounts_non_circulating_hook(
                                         &bank_for_calc,
+                                        Arc::clone(&non_circulating_abort),
+                                    );
+                                    calculate_non_circulating_supply_with_abort(
+                                        &bank_for_calc,
+                                        Some(non_circulating_abort),
                                         ScanOrigin::GetLargestAccounts,
                                     )
                                 })
@@ -1196,7 +1246,6 @@ impl JsonRpcRequestProcessor {
                             };
 
                             let bank_for_largest = Arc::clone(&bank_clone);
-                            let abort = entry_clone.abort_token();
                             let largest = tokio::task::spawn_blocking(move || {
                                 bank_for_largest.get_largest_accounts(
                                     NUM_LARGEST_ACCOUNTS,
@@ -5872,6 +5921,78 @@ pub mod tests {
             }
         };
         assert_eq!(result.value, expected);
+    }
+
+    #[tokio::test]
+    async fn test_largest_accounts_aborts_non_circulating_phase() {
+        let rpc = RpcHandler::start();
+        let filter = Some(RpcLargestAccountsFilter::Circulating);
+        let bank_id = rpc.working_bank().bank_id();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let observed_abort = Arc::new(AtomicBool::new(false));
+        let observed_abort_clone = Arc::clone(&observed_abort);
+
+        install_largest_accounts_non_circulating_hook(
+            bank_id,
+            Box::new(move |abort| {
+                started_tx.send(()).unwrap();
+                release_rx.blocking_recv().unwrap();
+                observed_abort_clone.store(abort.load(Ordering::Relaxed), Ordering::Relaxed);
+            }),
+        );
+
+        let meta = rpc.meta.clone();
+        let request_filter = filter.clone();
+        let request = tokio::spawn(async move {
+            meta.get_largest_accounts(Some(RpcLargestAccountsConfig {
+                filter: request_filter,
+                ..RpcLargestAccountsConfig::default()
+            }))
+            .await
+        });
+
+        started_rx.await.unwrap();
+        let entry = {
+            let map = rpc.meta.largest_accounts_coordinator.inner.lock().unwrap();
+            Arc::clone(
+                map.get(&filter)
+                    .expect("largest accounts generation missing"),
+            )
+        };
+
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(entry.abort_token().load(Ordering::Relaxed));
+        assert!(rpc.meta.get_cached_largest_accounts(&filter).is_none());
+
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            entry.wait().await,
+            Err("scan aborted: non-circulating supply calculation aborted".to_string())
+        );
+        assert!(observed_abort.load(Ordering::Relaxed));
+        assert!(rpc.meta.largest_accounts_coordinator.is_empty());
+
+        let replacement = rpc
+            .meta
+            .largest_accounts_coordinator
+            .get_or_create_with_waiter(&filter)
+            .unwrap_or_else(|_| panic!("replacement admission must succeed"));
+        assert!(replacement.is_producer);
+        let replacement_entry = Arc::clone(&replacement.entry);
+        let replacement_lease = crate::rpc_cache::SingleflightLease::new(
+            Arc::clone(&rpc.meta.largest_accounts_coordinator),
+            filter.clone(),
+            Arc::clone(&replacement_entry),
+        );
+        drop(replacement);
+        replacement_lease.publish_and_remove(Err("test cleanup".to_string()));
+        replacement_lease.mark_completed();
+
+        tokio::task::spawn_blocking(move || drop(rpc))
+            .await
+            .unwrap();
     }
 
     #[test]

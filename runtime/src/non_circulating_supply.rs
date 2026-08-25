@@ -4,12 +4,18 @@ use {
     solana_account::ReadableAccount,
     solana_accounts_db::{
         accounts_index::{AccountIndex, IndexKey},
-        accounts_scan::ScanResult,
+        accounts_scan::{ScanError, ScanResult},
     },
     solana_metrics::ScanOrigin,
     solana_pubkey::Pubkey,
     solana_stake_interface::{self as stake, state::StakeStateV2},
-    std::collections::HashSet,
+    std::{
+        collections::HashSet,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    },
 };
 
 pub struct NonCirculatingSupply {
@@ -21,6 +27,25 @@ pub fn calculate_non_circulating_supply(
     bank: &Bank,
     origin: ScanOrigin,
 ) -> ScanResult<NonCirculatingSupply> {
+    calculate_non_circulating_supply_with_abort(bank, None, origin)
+}
+
+pub fn calculate_non_circulating_supply_with_abort(
+    bank: &Bank,
+    abort: Option<Arc<AtomicBool>>,
+    origin: ScanOrigin,
+) -> ScanResult<NonCirculatingSupply> {
+    let is_aborted = || {
+        abort
+            .as_ref()
+            .is_some_and(|abort| abort.load(Ordering::Relaxed))
+    };
+    let aborted = || ScanError::Aborted("non-circulating supply calculation aborted".to_string());
+
+    if is_aborted() {
+        return Err(aborted());
+    }
+
     debug!("Updating Bank supply, epoch: {}", bank.epoch());
     let mut non_circulating_accounts_set: HashSet<Pubkey> = HashSet::new();
 
@@ -28,6 +53,10 @@ pub fn calculate_non_circulating_supply(
         non_circulating_accounts_set.insert(key);
     }
     let withdraw_authority_list = withdraw_authority();
+
+    if is_aborted() {
+        return Err(aborted());
+    }
 
     let clock = bank.clock();
     let stake_accounts = if bank
@@ -37,7 +66,7 @@ pub fn calculate_non_circulating_supply(
         .account_indexes
         .contains(&AccountIndex::ProgramId)
     {
-        bank.get_filtered_indexed_accounts(
+        bank.get_filtered_indexed_accounts_with_abort(
             &IndexKey::ProgramId(stake::program::id()),
             // The program-id account index checks for Account owner on inclusion. However, due to
             // the current AccountsDb implementation, an account may remain in storage as a
@@ -45,13 +74,17 @@ pub fn calculate_non_circulating_supply(
             // updates. We include the redundant filter here to avoid returning these accounts.
             |account| account.owner() == &stake::program::id(),
             None,
+            abort.clone(),
             origin,
         )?
     } else {
-        bank.get_program_accounts(&stake::program::id(), origin)?
+        bank.get_program_accounts_with_abort(&stake::program::id(), abort.clone(), origin)?
     };
 
     for (pubkey, account) in stake_accounts.iter() {
+        if is_aborted() {
+            return Err(aborted());
+        }
         let stake_account = account
             .deserialize_data::<StakeStateV2>()
             .unwrap_or_default();
@@ -72,10 +105,13 @@ pub fn calculate_non_circulating_supply(
         }
     }
 
-    let lamports = non_circulating_accounts_set
-        .iter()
-        .map(|pubkey| bank.get_balance(pubkey))
-        .sum();
+    let mut lamports = 0;
+    for pubkey in &non_circulating_accounts_set {
+        if is_aborted() {
+            return Err(aborted());
+        }
+        lamports += bank.get_balance(pubkey);
+    }
 
     Ok(NonCirculatingSupply {
         lamports,
