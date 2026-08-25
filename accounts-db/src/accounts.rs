@@ -33,7 +33,7 @@ use {
         collections::{BinaryHeap, HashMap, HashSet},
         sync::{
             Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     },
 };
@@ -260,12 +260,14 @@ impl Accounts {
         num: usize,
         filter_by_address: &HashSet<Pubkey>,
         filter: AccountAddressFilter,
+        abort: Option<Arc<AtomicBool>>,
         origin: ScanOrigin,
     ) -> ScanResult<Vec<(Pubkey, u64)>> {
         if num == 0 {
             return Ok(vec![]);
         }
         let mut account_balances = BinaryHeap::new();
+        let config = ScanConfig { abort };
         self.accounts_db.scan_accounts(
             ancestors,
             bank_id,
@@ -294,9 +296,14 @@ impl Accounts {
                     account_balances.push(Reverse((account.lamports(), *pubkey)));
                 }
             },
-            &ScanConfig::default(),
+            &config,
             origin,
         )?;
+        if config.is_aborted() {
+            return Err(ScanError::Aborted(
+                "largest accounts scan aborted".to_string(),
+            ));
+        }
         Ok(account_balances
             .into_sorted_vec()
             .into_iter()
@@ -1370,6 +1377,7 @@ mod tests {
                     0,
                     &HashSet::new(),
                     AccountAddressFilter::Exclude,
+                    None,
                     ScanOrigin::Other,
                 )
                 .unwrap(),
@@ -1383,6 +1391,7 @@ mod tests {
                     0,
                     &all_pubkeys,
                     AccountAddressFilter::Include,
+                    None,
                     ScanOrigin::Other,
                 )
                 .unwrap(),
@@ -1399,6 +1408,7 @@ mod tests {
                     1,
                     &HashSet::new(),
                     AccountAddressFilter::Exclude,
+                    None,
                     ScanOrigin::Other,
                 )
                 .unwrap(),
@@ -1412,6 +1422,7 @@ mod tests {
                     2,
                     &HashSet::new(),
                     AccountAddressFilter::Exclude,
+                    None,
                     ScanOrigin::Other,
                 )
                 .unwrap(),
@@ -1425,6 +1436,7 @@ mod tests {
                     3,
                     &HashSet::new(),
                     AccountAddressFilter::Exclude,
+                    None,
                     ScanOrigin::Other,
                 )
                 .unwrap(),
@@ -1440,6 +1452,7 @@ mod tests {
                     6,
                     &HashSet::new(),
                     AccountAddressFilter::Exclude,
+                    None,
                     ScanOrigin::Other,
                 )
                 .unwrap(),
@@ -1456,6 +1469,7 @@ mod tests {
                     1,
                     &exclude1,
                     AccountAddressFilter::Exclude,
+                    None,
                     ScanOrigin::Other,
                 )
                 .unwrap(),
@@ -1469,6 +1483,7 @@ mod tests {
                     2,
                     &exclude1,
                     AccountAddressFilter::Exclude,
+                    None,
                     ScanOrigin::Other,
                 )
                 .unwrap(),
@@ -1482,6 +1497,7 @@ mod tests {
                     3,
                     &exclude1,
                     AccountAddressFilter::Exclude,
+                    None,
                     ScanOrigin::Other,
                 )
                 .unwrap(),
@@ -1498,6 +1514,7 @@ mod tests {
                     1,
                     &include1_2,
                     AccountAddressFilter::Include,
+                    None,
                     ScanOrigin::Other,
                 )
                 .unwrap(),
@@ -1511,6 +1528,7 @@ mod tests {
                     2,
                     &include1_2,
                     AccountAddressFilter::Include,
+                    None,
                     ScanOrigin::Other,
                 )
                 .unwrap(),
@@ -1524,10 +1542,41 @@ mod tests {
                     3,
                     &include1_2,
                     AccountAddressFilter::Include,
+                    None,
                     ScanOrigin::Other,
                 )
                 .unwrap(),
             vec![(pubkey1, 42), (pubkey2, 41)]
+        );
+    }
+
+    #[test]
+    fn test_load_largest_accounts_aborted_scan_returns_error() {
+        let accounts_db = AccountsDb::new_single_for_tests();
+        let accounts = Accounts::new(Arc::new(accounts_db));
+        let pubkey = Pubkey::new_unique();
+        accounts.store_for_tests(
+            0,
+            &pubkey,
+            &AccountSharedData::new(42, 0, &Pubkey::default()),
+        );
+
+        let abort = Arc::new(AtomicBool::new(true));
+        let result = accounts.load_largest_accounts(
+            &Ancestors::from(vec![0]),
+            0,
+            1,
+            &HashSet::new(),
+            AccountAddressFilter::Exclude,
+            Some(abort),
+            ScanOrigin::Other,
+        );
+
+        assert_eq!(
+            result,
+            Err(ScanError::Aborted(
+                "largest accounts scan aborted".to_string()
+            ))
         );
     }
 

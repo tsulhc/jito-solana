@@ -5456,6 +5456,7 @@ impl Bank {
         filter_by_address: &HashSet<Pubkey>,
         filter: AccountAddressFilter,
         origin: ScanOrigin,
+        abort: Option<Arc<AtomicBool>>,
     ) -> ScanResult<Vec<(Pubkey, u64)>> {
         self.rc.accounts.load_largest_accounts(
             &self.ancestors,
@@ -5463,6 +5464,7 @@ impl Bank {
             num,
             filter_by_address,
             filter,
+            abort,
             origin,
         )
     }
