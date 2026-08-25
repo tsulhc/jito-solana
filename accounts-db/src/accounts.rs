@@ -666,6 +666,7 @@ mod tests {
         solana_sdk_ids::native_loader,
         solana_signature::Signature,
         solana_signer::{Signer, signers::Signers},
+        solana_stake_interface::program as stake_program,
         solana_transaction::{Transaction, sanitized::MAX_TX_ACCOUNT_LOCKS},
         solana_transaction_error::TransactionError,
         std::{
@@ -1633,6 +1634,71 @@ mod tests {
             Err(ScanError::Aborted(
                 "largest accounts scan aborted".to_string()
             ))
+        );
+    }
+
+    #[test]
+    fn test_load_by_index_key_with_abort_fallback_scan_returns_error() {
+        let stake_program_id = stake_program::id();
+        let mut indexed_keys = HashSet::new();
+        indexed_keys.insert(Pubkey::default());
+        let mut indexes = HashSet::new();
+        indexes.insert(crate::accounts_index::AccountIndex::ProgramId);
+        let accounts_db_config = crate::accounts_db::AccountsDbConfig {
+            account_indexes: Some(crate::accounts_index::AccountSecondaryIndexes {
+                keys: Some(crate::accounts_index::AccountSecondaryIndexesIncludeExclude {
+                    exclude: false,
+                    keys: indexed_keys,
+                }),
+                indexes,
+            }),
+            ..Default::default()
+        };
+        let accounts_db = AccountsDb::new_single_for_tests_with_provider_and_config(
+            crate::accounts_file::AccountsFileProvider::default(),
+            accounts_db_config,
+        );
+        let accounts = Accounts::new(Arc::new(accounts_db));
+        for _ in 0..4 {
+            accounts.store_for_tests(
+                0,
+                &Pubkey::new_unique(),
+                &AccountSharedData::new(1, 0, &stake_program_id),
+            );
+        }
+        accounts.add_root_and_flush_write_cache(0);
+
+        assert!(accounts
+            .accounts_db
+            .account_indexes
+            .contains(&crate::accounts_index::AccountIndex::ProgramId));
+        assert!(!accounts
+            .accounts_db
+            .account_indexes
+            .include_key(&stake_program_id));
+
+        let abort = Arc::new(AtomicBool::new(false));
+        let abort_for_callback = Arc::clone(&abort);
+        let visited = AtomicUsize::new(0);
+        let result = accounts.load_by_index_key_with_filter_with_abort(
+            &Ancestors::from(vec![0]),
+            0,
+            &IndexKey::ProgramId(stake_program_id),
+            |_account| {
+                if visited.fetch_add(1, Ordering::Relaxed) == 0 {
+                    abort_for_callback.store(true, Ordering::Relaxed);
+                }
+                true
+            },
+            None,
+            Some(abort),
+            ScanOrigin::Other,
+        );
+
+        assert_eq!(visited.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            result,
+            Err(ScanError::Aborted("account scan aborted".to_string()))
         );
     }
 
