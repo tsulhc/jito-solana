@@ -3,8 +3,8 @@ use {
     std::{
         collections::HashMap,
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc, Mutex,
+            atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
         },
         time::{Duration, SystemTime},
     },
@@ -91,12 +91,53 @@ pub(crate) struct LargestAccountsSingleflight {
     pub(crate) inner: Mutex<HashMap<Option<RpcLargestAccountsFilter>, Arc<InflightEntry>>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum GenerationState {
+    Active = 0,
+    Aborting = 1,
+    Completing = 2,
+    Terminal = 3,
+}
+
 pub(crate) struct InflightEntry {
     pub(crate) sender: watch::Sender<Option<Result<(u64, Vec<RpcAccountBalance>), String>>>,
     // Keep one receiver alive so `sender.send` always updates the stored value even if
     // waiters have not yet subscribed. Without this, `watch::Sender::send` fails when
     // receiver count is 0 and the value is not updated, causing deadlock.
     _receiver: watch::Receiver<Option<Result<(u64, Vec<RpcAccountBalance>), String>>>,
+    abort: Arc<AtomicBool>,
+    state: AtomicU8,
+    waiters: AtomicUsize,
+}
+
+pub(crate) struct SingleflightAdmission {
+    pub(crate) is_producer: bool,
+    pub(crate) entry: Arc<InflightEntry>,
+    pub(crate) waiter: SingleflightWaiterLease,
+}
+
+/// RAII ownership for one real RPC caller waiting on a generation.
+pub(crate) struct SingleflightWaiterLease {
+    coordinator: Arc<LargestAccountsSingleflight>,
+    key: Option<RpcLargestAccountsFilter>,
+    entry: Arc<InflightEntry>,
+}
+
+impl InflightEntry {
+    fn state(&self) -> GenerationState {
+        match self.state.load(Ordering::SeqCst) {
+            0 => GenerationState::Active,
+            1 => GenerationState::Aborting,
+            2 => GenerationState::Completing,
+            3 => GenerationState::Terminal,
+            value => panic!("invalid largest-accounts generation state: {value}"),
+        }
+    }
+
+    pub(crate) fn abort_token(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.abort)
+    }
 }
 
 impl LargestAccountsSingleflight {
@@ -106,9 +147,61 @@ impl LargestAccountsSingleflight {
         }
     }
 
-    /// Attempt to join or become producer for `key`.
-    /// Returns `(is_producer, entry)` where `is_producer==true` means caller
-    /// must spawn the owned producer task. Lock is held only for admission.
+    /// Admit one real RPC caller to an active generation or return a retiring
+    /// generation that must terminate before a new same-key producer is admitted.
+    pub(crate) fn get_or_create_with_waiter(
+        self: &Arc<Self>,
+        key: &Option<RpcLargestAccountsFilter>,
+    ) -> Result<SingleflightAdmission, Arc<InflightEntry>> {
+        let mut map = self.inner.lock().unwrap();
+        loop {
+            if let Some(entry) = map.get(key).cloned() {
+                match entry.state() {
+                    GenerationState::Active => {
+                        entry.waiters.fetch_add(1, Ordering::SeqCst);
+                        return Ok(SingleflightAdmission {
+                            is_producer: false,
+                            entry,
+                            waiter: SingleflightWaiterLease {
+                                coordinator: Arc::clone(self),
+                                key: key.clone(),
+                                entry: map.get(key).unwrap().clone(),
+                            },
+                        });
+                    }
+                    GenerationState::Aborting | GenerationState::Completing => {
+                        return Err(entry);
+                    }
+                    GenerationState::Terminal => {
+                        map.remove(key);
+                    }
+                }
+            } else {
+                let (tx, rx) = watch::channel(None);
+                let entry = Arc::new(InflightEntry {
+                    sender: tx,
+                    _receiver: rx,
+                    abort: Arc::new(AtomicBool::new(false)),
+                    state: AtomicU8::new(GenerationState::Active as u8),
+                    waiters: AtomicUsize::new(1),
+                });
+                map.insert(key.clone(), Arc::clone(&entry));
+                return Ok(SingleflightAdmission {
+                    is_producer: true,
+                    entry: Arc::clone(&entry),
+                    waiter: SingleflightWaiterLease {
+                        coordinator: Arc::clone(self),
+                        key: key.clone(),
+                        entry,
+                    },
+                });
+            }
+        }
+    }
+
+    /// Untracked admission retained only for deterministic unit tests that manually
+    /// model completion. Production callers must use `get_or_create_with_waiter`.
+    #[cfg(test)]
     pub(crate) fn get_or_create(
         &self,
         key: &Option<RpcLargestAccountsFilter>,
@@ -121,9 +214,55 @@ impl LargestAccountsSingleflight {
             let entry = Arc::new(InflightEntry {
                 sender: tx,
                 _receiver: rx,
+                abort: Arc::new(AtomicBool::new(false)),
+                state: AtomicU8::new(GenerationState::Active as u8),
+                waiters: AtomicUsize::new(0),
             });
             map.insert(key.clone(), Arc::clone(&entry));
             (true, entry)
+        }
+    }
+
+    fn try_commit_success(
+        &self,
+        key: &Option<RpcLargestAccountsFilter>,
+        entry: &Arc<InflightEntry>,
+    ) -> bool {
+        let map = self.inner.lock().unwrap();
+        let Some(existing) = map.get(key) else {
+            return false;
+        };
+        if !Arc::ptr_eq(existing, entry) {
+            return false;
+        }
+        existing
+            .state
+            .compare_exchange(
+                GenerationState::Active as u8,
+                GenerationState::Completing as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    fn publish_and_remove(
+        &self,
+        key: &Option<RpcLargestAccountsFilter>,
+        entry: &Arc<InflightEntry>,
+        result: Result<(u64, Vec<RpcAccountBalance>), String>,
+    ) {
+        let mut map = self.inner.lock().unwrap();
+        if let Some(existing) = map.get(key)
+            && Arc::ptr_eq(existing, entry)
+        {
+            existing
+                .state
+                .store(GenerationState::Terminal as u8, Ordering::SeqCst);
+            let _ = existing.sender.send(Some(result));
+            map.remove(key);
+        } else {
+            let _ = entry.sender.send(Some(result));
         }
     }
 
@@ -170,6 +309,15 @@ impl SingleflightLease {
     pub(crate) fn mark_completed(&self) {
         self.completed.store(true, Ordering::SeqCst);
     }
+
+    pub(crate) fn try_commit_success(&self) -> bool {
+        self.coordinator.try_commit_success(&self.key, &self.entry)
+    }
+
+    pub(crate) fn publish_and_remove(&self, result: Result<(u64, Vec<RpcAccountBalance>), String>) {
+        self.coordinator
+            .publish_and_remove(&self.key, &self.entry, result);
+    }
 }
 
 impl Drop for SingleflightLease {
@@ -178,15 +326,33 @@ impl Drop for SingleflightLease {
             return;
         }
         // Abnormal termination: wake waiters and clean only matching generation.
-        let _ = self
-            .entry
-            .sender
-            .send(Some(Err("producer task aborted".to_string())));
-        let mut map = self.coordinator.inner.lock().unwrap();
-        if let Some(existing) = map.get(&self.key) {
-            if Arc::ptr_eq(existing, &self.entry) {
-                map.remove(&self.key);
-            }
+        self.publish_and_remove(Err("producer task aborted".to_string()));
+    }
+}
+
+impl Drop for SingleflightWaiterLease {
+    fn drop(&mut self) {
+        let map = self.coordinator.inner.lock().unwrap();
+        let Some(existing) = map.get(&self.key) else {
+            return;
+        };
+        if !Arc::ptr_eq(existing, &self.entry) {
+            return;
+        }
+        let previous = self.entry.waiters.fetch_sub(1, Ordering::SeqCst);
+        if previous == 1
+            && self
+                .entry
+                .state
+                .compare_exchange(
+                    GenerationState::Active as u8,
+                    GenerationState::Aborting as u8,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+        {
+            self.entry.abort.store(true, Ordering::SeqCst);
         }
     }
 }
@@ -290,7 +456,9 @@ pub mod test {
             let sf2 = Arc::clone(&sf);
             let ent2 = Arc::clone(&entry);
             // Mimic Guard drop: send abort error then remove
-            let _ = ent2.sender.send(Some(Err("producer task aborted".to_string())));
+            let _ = ent2
+                .sender
+                .send(Some(Err("producer task aborted".to_string())));
             sf2.inner.lock().unwrap().remove(&key);
             // drop sender by not holding? keep entry alive for waiter
         }
@@ -301,5 +469,100 @@ pub mod test {
         // Future request can retry
         let (is_prod2, _) = sf.get_or_create(&key);
         assert!(is_prod2);
+    }
+
+    #[test]
+    fn test_waiter_drop_aborts_only_after_last_real_waiter() {
+        let coordinator = Arc::new(LargestAccountsSingleflight::new());
+        let key = Some(RpcLargestAccountsFilter::Circulating);
+        let producer = coordinator
+            .get_or_create_with_waiter(&key)
+            .unwrap_or_else(|_| panic!("initial admission must succeed"));
+        let waiter = coordinator
+            .get_or_create_with_waiter(&key)
+            .unwrap_or_else(|_| panic!("waiter admission must succeed"));
+        let entry = Arc::clone(&producer.entry);
+
+        drop(producer);
+        assert!(!entry.abort_token().load(Ordering::SeqCst));
+        drop(waiter);
+        assert!(entry.abort_token().load(Ordering::SeqCst));
+        assert_eq!(entry.state(), GenerationState::Aborting);
+
+        let Err(retiring) = coordinator.get_or_create_with_waiter(&key) else {
+            panic!("an aborting generation must not admit a new producer");
+        };
+        assert!(Arc::ptr_eq(&retiring, &entry));
+        coordinator.publish_and_remove(&key, &entry, Err("aborted".to_string()));
+
+        let replacement = coordinator
+            .get_or_create_with_waiter(&key)
+            .unwrap_or_else(|_| panic!("replacement admission must succeed"));
+        assert!(replacement.is_producer);
+        let replacement_entry = Arc::clone(&replacement.entry);
+        drop(replacement);
+        coordinator.publish_and_remove(&key, &replacement_entry, Err("test cleanup".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_new_caller_waits_for_aborting_generation_to_terminate() {
+        let coordinator = Arc::new(LargestAccountsSingleflight::new());
+        let key = Some(RpcLargestAccountsFilter::NonCirculating);
+        let first = coordinator
+            .get_or_create_with_waiter(&key)
+            .unwrap_or_else(|_| panic!("initial admission must succeed"));
+        let entry = Arc::clone(&first.entry);
+        drop(first);
+        assert!(entry.abort_token().load(Ordering::SeqCst));
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let coordinator_clone = Arc::clone(&coordinator);
+        let key_clone = key.clone();
+        let caller = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            let Err(retiring) = coordinator_clone.get_or_create_with_waiter(&key_clone) else {
+                panic!("caller must wait for the retiring generation");
+            };
+            retiring.wait().await.unwrap_err();
+            coordinator_clone
+                .get_or_create_with_waiter(&key_clone)
+                .unwrap_or_else(|_| panic!("replacement admission must succeed"))
+        });
+
+        started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!caller.is_finished());
+
+        coordinator.publish_and_remove(&key, &entry, Err("aborted".to_string()));
+        let replacement = caller.await.unwrap();
+        assert!(replacement.is_producer);
+        let replacement_entry = Arc::clone(&replacement.entry);
+        drop(replacement);
+        coordinator.publish_and_remove(&key, &replacement_entry, Err("test cleanup".to_string()));
+    }
+
+    #[test]
+    fn test_completion_wins_over_waiter_drop() {
+        let coordinator = Arc::new(LargestAccountsSingleflight::new());
+        let key = Some(RpcLargestAccountsFilter::Circulating);
+        let producer = coordinator
+            .get_or_create_with_waiter(&key)
+            .unwrap_or_else(|_| panic!("initial admission must succeed"));
+        let waiter = coordinator
+            .get_or_create_with_waiter(&key)
+            .unwrap_or_else(|_| panic!("waiter admission must succeed"));
+        let entry = Arc::clone(&producer.entry);
+        let lease =
+            SingleflightLease::new(Arc::clone(&coordinator), key.clone(), Arc::clone(&entry));
+
+        assert!(lease.try_commit_success());
+        drop(waiter);
+        assert!(!entry.abort_token().load(Ordering::SeqCst));
+        assert_eq!(entry.state(), GenerationState::Completing);
+
+        lease.publish_and_remove(Ok((1, vec![])));
+        lease.mark_completed();
+        drop(producer);
+        assert!(coordinator.is_empty());
     }
 }

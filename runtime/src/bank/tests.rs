@@ -8447,6 +8447,7 @@ fn test_get_largest_accounts() {
             &pubkeys_hashset,
             AccountAddressFilter::Include,
             ScanOrigin::Other,
+            None,
         )
         .unwrap(),
         vec![(pubkeys[4], 500 * LAMPORTS_PER_SOL)]
@@ -8457,6 +8458,7 @@ fn test_get_largest_accounts() {
             &exclude_hashset,
             AccountAddressFilter::Exclude,
             ScanOrigin::Other,
+            None,
         )
         .unwrap(),
         vec![(pubkeys[4], 500 * LAMPORTS_PER_SOL)]
@@ -8466,7 +8468,8 @@ fn test_get_largest_accounts() {
             1,
             &exclude4,
             AccountAddressFilter::Exclude,
-            ScanOrigin::Other
+            ScanOrigin::Other,
+            None,
         )
         .unwrap(),
         vec![(pubkeys[3], 400 * LAMPORTS_PER_SOL)]
@@ -8479,6 +8482,7 @@ fn test_get_largest_accounts() {
             &pubkeys_hashset,
             AccountAddressFilter::Include,
             ScanOrigin::Other,
+            None,
         )
         .unwrap();
     assert_eq!(results.len(), sorted_accounts.len());
@@ -8496,6 +8500,7 @@ fn test_get_largest_accounts() {
             &exclude4,
             AccountAddressFilter::Exclude,
             ScanOrigin::Other,
+            None,
         )
         .unwrap();
     // results include 5 Bank builtins
@@ -8515,6 +8520,7 @@ fn test_get_largest_accounts() {
             &pubkeys_hashset,
             AccountAddressFilter::Include,
             ScanOrigin::Other,
+            None,
         )
         .unwrap();
     assert_eq!(results.len(), expected_accounts.len());
@@ -8529,6 +8535,7 @@ fn test_get_largest_accounts() {
             &exclude4,
             AccountAddressFilter::Exclude,
             ScanOrigin::Other,
+            None,
         )
         .unwrap();
     assert_eq!(results.len(), expected_accounts.len());
@@ -8547,7 +8554,8 @@ fn test_get_largest_accounts() {
             2,
             &exclude,
             AccountAddressFilter::Exclude,
-            ScanOrigin::Other
+            ScanOrigin::Other,
+            None,
         )
         .unwrap(),
         vec![pubkeys_balances[3], pubkeys_balances[1]]

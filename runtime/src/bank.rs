@@ -5361,9 +5361,22 @@ impl Bank {
         program_id: &Pubkey,
         origin: ScanOrigin,
     ) -> ScanResult<Vec<KeyedAccountSharedData>> {
-        self.rc
-            .accounts
-            .load_by_program(&self.ancestors, self.bank_id, program_id, origin)
+        self.get_program_accounts_with_abort(program_id, None, origin)
+    }
+
+    pub fn get_program_accounts_with_abort(
+        &self,
+        program_id: &Pubkey,
+        abort: Option<Arc<AtomicBool>>,
+        origin: ScanOrigin,
+    ) -> ScanResult<Vec<KeyedAccountSharedData>> {
+        self.rc.accounts.load_by_program_with_abort(
+            &self.ancestors,
+            self.bank_id,
+            program_id,
+            abort,
+            origin,
+        )
     }
 
     pub fn get_filtered_program_accounts<F: Fn(&AccountSharedData) -> bool>(
@@ -5388,12 +5401,30 @@ impl Bank {
         byte_limit_for_scan: Option<usize>,
         origin: ScanOrigin,
     ) -> ScanResult<Vec<KeyedAccountSharedData>> {
-        self.rc.accounts.load_by_index_key_with_filter(
+        self.get_filtered_indexed_accounts_with_abort(
+            index_key,
+            filter,
+            byte_limit_for_scan,
+            None,
+            origin,
+        )
+    }
+
+    pub fn get_filtered_indexed_accounts_with_abort<F: Fn(&AccountSharedData) -> bool>(
+        &self,
+        index_key: &IndexKey,
+        filter: F,
+        byte_limit_for_scan: Option<usize>,
+        abort: Option<Arc<AtomicBool>>,
+        origin: ScanOrigin,
+    ) -> ScanResult<Vec<KeyedAccountSharedData>> {
+        self.rc.accounts.load_by_index_key_with_filter_with_abort(
             &self.ancestors,
             self.bank_id,
             index_key,
             filter,
             byte_limit_for_scan,
+            abort,
             origin,
         )
     }
@@ -5456,6 +5487,7 @@ impl Bank {
         filter_by_address: &HashSet<Pubkey>,
         filter: AccountAddressFilter,
         origin: ScanOrigin,
+        abort: Option<Arc<AtomicBool>>,
     ) -> ScanResult<Vec<(Pubkey, u64)>> {
         self.rc.accounts.load_largest_accounts(
             &self.ancestors,
@@ -5463,6 +5495,7 @@ impl Bank {
             num,
             filter_by_address,
             filter,
+            abort,
             origin,
         )
     }
