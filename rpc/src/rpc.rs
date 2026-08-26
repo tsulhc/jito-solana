@@ -6186,6 +6186,23 @@ pub mod tests {
     #[tokio::test]
     async fn test_get_supply_aborts_during_fallback_scan() {
         let _test_lock = get_supply_test_lock();
+        let scan_metric_value = |exposition: &str, metric: &str| -> u64 {
+            let prefix = format!(r#"{metric}{{origin="get_supply"}} "#);
+            exposition
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix))
+                .and_then(|value| value.parse().ok())
+                .expect("getSupply scan metric missing from exposition")
+        };
+        let metrics_before = solana_metrics::pull_metrics().exposition();
+        let started_before = scan_metric_value(
+            &metrics_before,
+            "agave_accounts_scan_origin_started_total",
+        );
+        let completed_before = scan_metric_value(
+            &metrics_before,
+            "agave_accounts_scan_origin_completed_total",
+        );
         let mut indexes = HashSet::new();
         indexes.insert(solana_accounts_db::accounts_index::AccountIndex::ProgramId);
         let rpc = RpcHandler::start_with_config(JsonRpcConfig {
@@ -6285,6 +6302,17 @@ pub mod tests {
         })
         .await
         .expect("fallback AccountsDB scan did not balance");
+        let metrics_after = solana_metrics::pull_metrics().exposition();
+        let started_after = scan_metric_value(
+            &metrics_after,
+            "agave_accounts_scan_origin_started_total",
+        );
+        let completed_after = scan_metric_value(
+            &metrics_after,
+            "agave_accounts_scan_origin_completed_total",
+        );
+        assert!(started_after > started_before);
+        assert!(completed_after > completed_before);
 
         tokio::task::spawn_blocking(move || drop(rpc))
             .await
