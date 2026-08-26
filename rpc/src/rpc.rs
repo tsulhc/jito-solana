@@ -70,8 +70,7 @@ use {
         bank_forks::BankForks,
         commitment::{BlockCommitmentArray, BlockCommitmentCache},
         non_circulating_supply::{
-            NonCirculatingSupply, calculate_non_circulating_supply,
-            calculate_non_circulating_supply_with_abort,
+            NonCirculatingSupply, calculate_non_circulating_supply_with_abort,
         },
         prioritization_fee_cache::PrioritizationFeeCache,
         stake_utils,
@@ -152,6 +151,51 @@ static LARGEST_ACCOUNTS_NON_CIRCULATING_HOOK: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 #[cfg(test)]
+static GET_SUPPLY_NON_CIRCULATING_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<(BankId, Box<dyn FnOnce(Arc<AtomicBool>) + Send>)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static GET_SUPPLY_SUBMISSION_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<(BankId, Box<dyn FnOnce(Arc<AtomicBool>) + Send>)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static GET_SUPPLY_NON_CIRCULATING_RESULT_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<
+        Option<(
+            BankId,
+            Box<dyn FnOnce(&ScanResult<NonCirculatingSupply>) + Send>,
+        )>,
+    >,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static GET_SUPPLY_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+struct GetSupplyAbortGuard {
+    abort: Option<Arc<AtomicBool>>,
+}
+
+impl GetSupplyAbortGuard {
+    fn new(abort: Arc<AtomicBool>) -> Self {
+        Self { abort: Some(abort) }
+    }
+
+    fn disarm(&mut self) {
+        self.abort = None;
+    }
+}
+
+impl Drop for GetSupplyAbortGuard {
+    fn drop(&mut self) {
+        if let Some(abort) = self.abort.take() {
+            abort.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(test)]
 fn install_largest_accounts_non_circulating_hook(
     bank_id: BankId,
     hook: Box<dyn FnOnce(Arc<AtomicBool>) + Send>,
@@ -182,6 +226,116 @@ fn run_largest_accounts_non_circulating_hook(bank: &Bank, abort: Arc<AtomicBool>
     if let Some(hook) = hook {
         hook(abort);
     }
+}
+
+#[cfg(test)]
+fn install_get_supply_non_circulating_hook(
+    bank_id: BankId,
+    hook: Box<dyn FnOnce(Arc<AtomicBool>) + Send>,
+) {
+    let mut installed = GET_SUPPLY_NON_CIRCULATING_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap();
+    assert!(installed.replace((bank_id, hook)).is_none());
+}
+
+#[cfg(test)]
+fn run_get_supply_non_circulating_hook(bank: &Bank, abort: Arc<AtomicBool>) {
+    let hook = {
+        let mut installed = GET_SUPPLY_NON_CIRCULATING_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap();
+        if installed
+            .as_ref()
+            .is_some_and(|(bank_id, _)| *bank_id == bank.bank_id())
+        {
+            installed.take().map(|(_, hook)| hook)
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        hook(abort);
+    }
+}
+
+#[cfg(test)]
+fn install_get_supply_submission_hook(
+    bank_id: BankId,
+    hook: Box<dyn FnOnce(Arc<AtomicBool>) + Send>,
+) {
+    let mut installed = GET_SUPPLY_SUBMISSION_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap();
+    assert!(installed.replace((bank_id, hook)).is_none());
+}
+
+#[cfg(test)]
+fn run_get_supply_submission_hook(bank_id: BankId, abort: Arc<AtomicBool>) {
+    let hook = {
+        let mut installed = GET_SUPPLY_SUBMISSION_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap();
+        if installed
+            .as_ref()
+            .is_some_and(|(installed_bank_id, _)| *installed_bank_id == bank_id)
+        {
+            installed.take().map(|(_, hook)| hook)
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        hook(abort);
+    }
+}
+
+#[cfg(test)]
+fn install_get_supply_non_circulating_result_hook(
+    bank_id: BankId,
+    hook: Box<dyn FnOnce(&ScanResult<NonCirculatingSupply>) + Send>,
+) {
+    let mut installed = GET_SUPPLY_NON_CIRCULATING_RESULT_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap();
+    assert!(installed.replace((bank_id, hook)).is_none());
+}
+
+#[cfg(test)]
+fn run_get_supply_non_circulating_result_hook(
+    bank: &Bank,
+    result: &ScanResult<NonCirculatingSupply>,
+) {
+    let hook = {
+        let mut installed = GET_SUPPLY_NON_CIRCULATING_RESULT_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap();
+        if installed
+            .as_ref()
+            .is_some_and(|(bank_id, _)| *bank_id == bank.bank_id())
+        {
+            installed.take().map(|(_, hook)| hook)
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        hook(result);
+    }
+}
+
+#[cfg(test)]
+fn get_supply_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    GET_SUPPLY_TEST_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap()
 }
 
 fn new_response<T>(bank: &Bank, value: T) -> RpcResponse<T> {
@@ -344,10 +498,30 @@ impl JsonRpcRequestProcessor {
         origin: ScanOrigin,
     ) -> ScanResult<NonCirculatingSupply> {
         let bank = Arc::clone(bank);
-        self.runtime
-            .spawn_blocking(move || calculate_non_circulating_supply(&bank, origin))
-            .await
-            .expect("Failed to spawn blocking task")
+        let abort_token = Arc::new(AtomicBool::new(false));
+        let mut abort_guard = GetSupplyAbortGuard::new(Arc::clone(&abort_token));
+        #[cfg(test)]
+        let bank_id = bank.bank_id();
+        #[cfg(test)]
+        let abort_token_for_submission_hook = Arc::clone(&abort_token);
+        let abort_token_for_worker = Arc::clone(&abort_token);
+        let join_handle = self.runtime.spawn_blocking(move || {
+            #[cfg(test)]
+            run_get_supply_non_circulating_hook(&bank, Arc::clone(&abort_token_for_worker));
+            let result = calculate_non_circulating_supply_with_abort(
+                &bank,
+                Some(abort_token_for_worker),
+                origin,
+            );
+            #[cfg(test)]
+            run_get_supply_non_circulating_result_hook(&bank, &result);
+            result
+        });
+        #[cfg(test)]
+        run_get_supply_submission_hook(bank_id, abort_token_for_submission_hook);
+        let result = join_handle.await;
+        abort_guard.disarm();
+        result.expect("Failed to spawn blocking task")
     }
 
     pub async fn get_filtered_indexed_accounts(
@@ -5921,6 +6095,276 @@ pub mod tests {
             }
         };
         assert_eq!(result.value, expected);
+    }
+
+    #[tokio::test]
+    async fn test_get_supply_aborts_before_worker_starts() {
+        let _test_lock = get_supply_test_lock();
+        let rpc = RpcHandler::start_with_config(JsonRpcConfig {
+            rpc_blocking_threads: 1,
+            ..JsonRpcConfig::default()
+        });
+        let bank_id = rpc.working_bank().bank_id();
+        let (worker_tx, worker_rx) = tokio::sync::oneshot::channel();
+        let (hook_release_tx, hook_release_rx) = tokio::sync::oneshot::channel();
+        let (hook_done_tx, hook_done_rx) = tokio::sync::oneshot::channel();
+        install_get_supply_non_circulating_hook(
+            bank_id,
+            Box::new(move |abort| {
+                worker_tx.send(Arc::clone(&abort)).unwrap();
+                hook_release_rx.blocking_recv().unwrap();
+                hook_done_tx.send(abort.load(Ordering::Relaxed)).unwrap();
+            }),
+        );
+        let (submission_tx, submission_rx) = tokio::sync::oneshot::channel();
+        install_get_supply_submission_hook(
+            bank_id,
+            Box::new(move |abort| {
+                submission_tx.send(abort).unwrap();
+            }),
+        );
+
+        let (blocker_started_tx, blocker_started_rx) = tokio::sync::oneshot::channel();
+        let (blocker_release_tx, blocker_release_rx) = tokio::sync::oneshot::channel();
+        let blocker = rpc.meta.runtime.spawn_blocking(move || {
+            blocker_started_tx.send(()).unwrap();
+            blocker_release_rx.blocking_recv().unwrap();
+        });
+        blocker_started_rx.await.unwrap();
+
+        let meta = rpc.meta.clone();
+        let request = tokio::spawn(async move { meta.get_supply(None).await });
+        let abort = submission_rx.await.unwrap();
+        assert!(!abort.load(Ordering::Relaxed));
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(abort.load(Ordering::Relaxed));
+
+        blocker_release_tx.send(()).unwrap();
+        blocker.await.unwrap();
+        let worker_abort = worker_rx.await.unwrap();
+        assert!(Arc::ptr_eq(&abort, &worker_abort));
+        assert!(abort.load(Ordering::Relaxed));
+        hook_release_tx.send(()).unwrap();
+        assert!(hook_done_rx.await.unwrap());
+
+        tokio::task::spawn_blocking(move || drop(rpc))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_get_supply_cancellation_is_per_request() {
+        let _test_lock = get_supply_test_lock();
+        let rpc = RpcHandler::start_with_config(JsonRpcConfig {
+            rpc_blocking_threads: 2,
+            ..JsonRpcConfig::default()
+        });
+        let bank = rpc.working_bank();
+        let bank_id = bank.bank_id();
+
+        let (a_token_tx, a_token_rx) = tokio::sync::oneshot::channel();
+        let (a_release_tx, a_release_rx) = tokio::sync::oneshot::channel();
+        let (a_done_tx, a_done_rx) = tokio::sync::oneshot::channel();
+        install_get_supply_non_circulating_hook(
+            bank_id,
+            Box::new(move |abort| {
+                a_token_tx.send(Arc::clone(&abort)).unwrap();
+                a_release_rx.blocking_recv().unwrap();
+                a_done_tx.send(abort.load(Ordering::Relaxed)).unwrap();
+            }),
+        );
+
+        let meta = rpc.meta.clone();
+        let request_a = tokio::spawn(async move { meta.get_supply(None).await });
+        let token_a = a_token_rx.await.unwrap();
+
+        let (b_token_tx, b_token_rx) = tokio::sync::oneshot::channel();
+        let (b_release_tx, b_release_rx) = tokio::sync::oneshot::channel();
+        let (b_done_tx, b_done_rx) = tokio::sync::oneshot::channel();
+        install_get_supply_non_circulating_hook(
+            bank_id,
+            Box::new(move |abort| {
+                b_token_tx.send(Arc::clone(&abort)).unwrap();
+                b_release_rx.blocking_recv().unwrap();
+                b_done_tx.send(abort.load(Ordering::Relaxed)).unwrap();
+            }),
+        );
+
+        let meta = rpc.meta.clone();
+        let request_b = tokio::spawn(async move { meta.get_supply(None).await });
+        let token_b = b_token_rx.await.unwrap();
+        assert!(!Arc::ptr_eq(&token_a, &token_b));
+        assert!(!token_a.load(Ordering::Relaxed));
+        assert!(!token_b.load(Ordering::Relaxed));
+
+        request_a.abort();
+        assert!(request_a.await.unwrap_err().is_cancelled());
+        assert!(token_a.load(Ordering::Relaxed));
+        assert!(!token_b.load(Ordering::Relaxed));
+
+        a_release_tx.send(()).unwrap();
+        assert!(a_done_rx.await.unwrap());
+
+        b_release_tx.send(()).unwrap();
+        assert!(!b_done_rx.await.unwrap());
+        let response_b = request_b
+            .await
+            .unwrap()
+            .expect("getSupply request B should complete");
+        assert!(!token_b.load(Ordering::Relaxed));
+
+        let mut result_b = response_b.value;
+        result_b.non_circulating_accounts.sort();
+        let mut non_circulating_accounts: Vec<String> = non_circulating_accounts()
+            .iter()
+            .map(|pubkey| pubkey.to_string())
+            .collect();
+        non_circulating_accounts.sort();
+        assert_eq!(
+            result_b,
+            RpcSupply {
+                non_circulating: 0,
+                circulating: bank.capitalization(),
+                total: bank.capitalization(),
+                non_circulating_accounts,
+            }
+        );
+
+        tokio::task::spawn_blocking(move || drop(rpc))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_get_supply_aborts_during_fallback_scan() {
+        let _test_lock = get_supply_test_lock();
+        let scan_metric_value = |exposition: &str, metric: &str| -> u64 {
+            let prefix = format!(r#"{metric}{{origin="get_supply"}} "#);
+            exposition
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix))
+                .and_then(|value| value.parse().ok())
+                .expect("getSupply scan metric missing from exposition")
+        };
+        let metrics_before = solana_metrics::pull_metrics().exposition();
+        let started_before =
+            scan_metric_value(&metrics_before, "agave_accounts_scan_origin_started_total");
+        let completed_before = scan_metric_value(
+            &metrics_before,
+            "agave_accounts_scan_origin_completed_total",
+        );
+        let mut indexes = HashSet::new();
+        indexes.insert(solana_accounts_db::accounts_index::AccountIndex::ProgramId);
+        let rpc = RpcHandler::start_with_config(JsonRpcConfig {
+            account_indexes: AccountSecondaryIndexes {
+                keys: Some(
+                    solana_accounts_db::accounts_index::AccountSecondaryIndexesIncludeExclude {
+                        exclude: false,
+                        keys: HashSet::new(),
+                    },
+                ),
+                indexes,
+            },
+            ..JsonRpcConfig::default()
+        });
+        let bank = rpc.working_bank();
+        let stake_program_id = solana_stake_interface::program::id();
+        let account = AccountSharedData::new(1, 0, &stake_program_id);
+        for _ in 0..10_000 {
+            bank.store_account(&Pubkey::new_unique(), &account);
+        }
+        bank.force_flush_accounts_cache();
+        assert!(
+            bank.rc
+                .accounts
+                .accounts_db
+                .account_indexes
+                .contains(&solana_accounts_db::accounts_index::AccountIndex::ProgramId)
+        );
+        assert!(!bank.account_indexes_include_key(&stake_program_id));
+
+        let bank_id = bank.bank_id();
+        let (token_tx, token_rx) = tokio::sync::oneshot::channel();
+        install_get_supply_non_circulating_hook(
+            bank_id,
+            Box::new(move |abort| {
+                token_tx.send(abort).unwrap();
+            }),
+        );
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        install_get_supply_non_circulating_result_hook(
+            bank_id,
+            Box::new(move |result| {
+                let result = match result {
+                    Ok(supply) => Ok((supply.lamports, supply.accounts.len())),
+                    Err(solana_accounts_db::accounts_scan::ScanError::Aborted(message)) => {
+                        Err(message.clone())
+                    }
+                    Err(error) => panic!("unexpected non-circulating supply error: {error:?}"),
+                };
+                result_tx.send(result).unwrap();
+            }),
+        );
+        let baseline = bank
+            .rc
+            .accounts
+            .accounts_db
+            .scan_tracker
+            .active_scans
+            .load(Ordering::Relaxed);
+        let meta = rpc.meta.clone();
+        let request = tokio::spawn(async move { meta.get_supply(None).await });
+        let abort = token_rx.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while bank
+                .rc
+                .accounts
+                .accounts_db
+                .scan_tracker
+                .active_scans
+                .load(Ordering::Relaxed)
+                == baseline
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fallback AccountsDB scan did not start");
+
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(abort.load(Ordering::Relaxed));
+        assert_eq!(
+            result_rx.await.unwrap(),
+            Err("account scan aborted".to_string())
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while bank
+                .rc
+                .accounts
+                .accounts_db
+                .scan_tracker
+                .active_scans
+                .load(Ordering::Relaxed)
+                != baseline
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fallback AccountsDB scan did not balance");
+        let metrics_after = solana_metrics::pull_metrics().exposition();
+        let started_after =
+            scan_metric_value(&metrics_after, "agave_accounts_scan_origin_started_total");
+        let completed_after =
+            scan_metric_value(&metrics_after, "agave_accounts_scan_origin_completed_total");
+        assert!(started_after > started_before);
+        assert!(completed_after > completed_before);
+
+        tokio::task::spawn_blocking(move || drop(rpc))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
