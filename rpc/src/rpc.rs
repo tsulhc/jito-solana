@@ -171,8 +171,7 @@ static GET_SUPPLY_NON_CIRCULATING_RESULT_HOOK: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 #[cfg(test)]
-static GET_SUPPLY_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
-    std::sync::OnceLock::new();
+static GET_SUPPLY_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 
 struct GetSupplyAbortGuard {
     abort: Option<Arc<AtomicBool>>,
@@ -6249,10 +6248,8 @@ pub mod tests {
                 .expect("getSupply scan metric missing from exposition")
         };
         let metrics_before = solana_metrics::pull_metrics().exposition();
-        let started_before = scan_metric_value(
-            &metrics_before,
-            "agave_accounts_scan_origin_started_total",
-        );
+        let started_before =
+            scan_metric_value(&metrics_before, "agave_accounts_scan_origin_started_total");
         let completed_before = scan_metric_value(
             &metrics_before,
             "agave_accounts_scan_origin_completed_total",
@@ -6278,12 +6275,13 @@ pub mod tests {
             bank.store_account(&Pubkey::new_unique(), &account);
         }
         bank.force_flush_accounts_cache();
-        assert!(bank
-            .rc
-            .accounts
-            .accounts_db
-            .account_indexes
-            .contains(&solana_accounts_db::accounts_index::AccountIndex::ProgramId));
+        assert!(
+            bank.rc
+                .accounts
+                .accounts_db
+                .account_indexes
+                .contains(&solana_accounts_db::accounts_index::AccountIndex::ProgramId)
+        );
         assert!(!bank.account_indexes_include_key(&stake_program_id));
 
         let bank_id = bank.bank_id();
@@ -6357,14 +6355,10 @@ pub mod tests {
         .await
         .expect("fallback AccountsDB scan did not balance");
         let metrics_after = solana_metrics::pull_metrics().exposition();
-        let started_after = scan_metric_value(
-            &metrics_after,
-            "agave_accounts_scan_origin_started_total",
-        );
-        let completed_after = scan_metric_value(
-            &metrics_after,
-            "agave_accounts_scan_origin_completed_total",
-        );
+        let started_after =
+            scan_metric_value(&metrics_after, "agave_accounts_scan_origin_started_total");
+        let completed_after =
+            scan_metric_value(&metrics_after, "agave_accounts_scan_origin_completed_total");
         assert!(started_after > started_before);
         assert!(completed_after > completed_before);
 
