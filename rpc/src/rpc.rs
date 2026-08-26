@@ -156,6 +156,11 @@ static GET_SUPPLY_NON_CIRCULATING_HOOK: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 #[cfg(test)]
+static GET_SUPPLY_SUBMISSION_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<(BankId, Box<dyn FnOnce(Arc<AtomicBool>) + Send>)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
 static GET_SUPPLY_NON_CIRCULATING_RESULT_HOOK: std::sync::OnceLock<
     std::sync::Mutex<
         Option<(
@@ -246,6 +251,39 @@ fn run_get_supply_non_circulating_hook(bank: &Bank, abort: Arc<AtomicBool>) {
         if installed
             .as_ref()
             .is_some_and(|(bank_id, _)| *bank_id == bank.bank_id())
+        {
+            installed.take().map(|(_, hook)| hook)
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        hook(abort);
+    }
+}
+
+#[cfg(test)]
+fn install_get_supply_submission_hook(
+    bank_id: BankId,
+    hook: Box<dyn FnOnce(Arc<AtomicBool>) + Send>,
+) {
+    let mut installed = GET_SUPPLY_SUBMISSION_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap();
+    assert!(installed.replace((bank_id, hook)).is_none());
+}
+
+#[cfg(test)]
+fn run_get_supply_submission_hook(bank_id: BankId, abort: Arc<AtomicBool>) {
+    let hook = {
+        let mut installed = GET_SUPPLY_SUBMISSION_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap();
+        if installed
+            .as_ref()
+            .is_some_and(|(installed_bank_id, _)| *installed_bank_id == bank_id)
         {
             installed.take().map(|(_, hook)| hook)
         } else {
@@ -463,6 +501,10 @@ impl JsonRpcRequestProcessor {
         let bank = Arc::clone(bank);
         let abort_token = Arc::new(AtomicBool::new(false));
         let mut abort_guard = GetSupplyAbortGuard::new(Arc::clone(&abort_token));
+        #[cfg(test)]
+        let bank_id = bank.bank_id();
+        #[cfg(test)]
+        let abort_token_for_submission_hook = Arc::clone(&abort_token);
         let abort_token_for_worker = Arc::clone(&abort_token);
         let join_handle = self.runtime.spawn_blocking(move || {
             #[cfg(test)]
@@ -476,6 +518,8 @@ impl JsonRpcRequestProcessor {
             run_get_supply_non_circulating_result_hook(&bank, &result);
             result
         });
+        #[cfg(test)]
+        run_get_supply_submission_hook(bank_id, abort_token_for_submission_hook);
         let result = join_handle.await;
         abort_guard.disarm();
         result.expect("Failed to spawn blocking task")
@@ -6073,6 +6117,13 @@ pub mod tests {
                 hook_done_tx.send(abort.load(Ordering::Relaxed)).unwrap();
             }),
         );
+        let (submission_tx, submission_rx) = tokio::sync::oneshot::channel();
+        install_get_supply_submission_hook(
+            bank_id,
+            Box::new(move |abort| {
+                submission_tx.send(abort).unwrap();
+            }),
+        );
 
         let (blocker_started_tx, blocker_started_rx) = tokio::sync::oneshot::channel();
         let (blocker_release_tx, blocker_release_rx) = tokio::sync::oneshot::channel();
@@ -6084,13 +6135,16 @@ pub mod tests {
 
         let meta = rpc.meta.clone();
         let request = tokio::spawn(async move { meta.get_supply(None).await });
-        tokio::task::yield_now().await;
+        let abort = submission_rx.await.unwrap();
+        assert!(!abort.load(Ordering::Relaxed));
         request.abort();
         assert!(request.await.unwrap_err().is_cancelled());
+        assert!(abort.load(Ordering::Relaxed));
 
         blocker_release_tx.send(()).unwrap();
         blocker.await.unwrap();
-        let abort = worker_rx.await.unwrap();
+        let worker_abort = worker_rx.await.unwrap();
+        assert!(Arc::ptr_eq(&abort, &worker_abort));
         assert!(abort.load(Ordering::Relaxed));
         hook_release_tx.send(()).unwrap();
         assert!(hook_done_rx.await.unwrap());
