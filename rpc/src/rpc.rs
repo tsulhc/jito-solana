@@ -70,8 +70,7 @@ use {
         bank_forks::BankForks,
         commitment::{BlockCommitmentArray, BlockCommitmentCache},
         non_circulating_supply::{
-            NonCirculatingSupply, calculate_non_circulating_supply,
-            calculate_non_circulating_supply_with_abort,
+            NonCirculatingSupply, calculate_non_circulating_supply_with_abort,
         },
         prioritization_fee_cache::PrioritizationFeeCache,
         stake_utils,
@@ -152,6 +151,33 @@ static LARGEST_ACCOUNTS_NON_CIRCULATING_HOOK: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 #[cfg(test)]
+static GET_SUPPLY_NON_CIRCULATING_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<(BankId, Box<dyn FnOnce(Arc<AtomicBool>) + Send>)>>,
+> = std::sync::OnceLock::new();
+
+struct GetSupplyAbortGuard {
+    abort: Option<Arc<AtomicBool>>,
+}
+
+impl GetSupplyAbortGuard {
+    fn new(abort: Arc<AtomicBool>) -> Self {
+        Self { abort: Some(abort) }
+    }
+
+    fn disarm(&mut self) {
+        self.abort = None;
+    }
+}
+
+impl Drop for GetSupplyAbortGuard {
+    fn drop(&mut self) {
+        if let Some(abort) = self.abort.take() {
+            abort.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(test)]
 fn install_largest_accounts_non_circulating_hook(
     bank_id: BankId,
     hook: Box<dyn FnOnce(Arc<AtomicBool>) + Send>,
@@ -167,6 +193,39 @@ fn install_largest_accounts_non_circulating_hook(
 fn run_largest_accounts_non_circulating_hook(bank: &Bank, abort: Arc<AtomicBool>) {
     let hook = {
         let mut installed = LARGEST_ACCOUNTS_NON_CIRCULATING_HOOK
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap();
+        if installed
+            .as_ref()
+            .is_some_and(|(bank_id, _)| *bank_id == bank.bank_id())
+        {
+            installed.take().map(|(_, hook)| hook)
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        hook(abort);
+    }
+}
+
+#[cfg(test)]
+fn install_get_supply_non_circulating_hook(
+    bank_id: BankId,
+    hook: Box<dyn FnOnce(Arc<AtomicBool>) + Send>,
+) {
+    let mut installed = GET_SUPPLY_NON_CIRCULATING_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap();
+    assert!(installed.replace((bank_id, hook)).is_none());
+}
+
+#[cfg(test)]
+fn run_get_supply_non_circulating_hook(bank: &Bank, abort: Arc<AtomicBool>) {
+    let hook = {
+        let mut installed = GET_SUPPLY_NON_CIRCULATING_HOOK
             .get_or_init(|| std::sync::Mutex::new(None))
             .lock()
             .unwrap();
@@ -344,10 +403,21 @@ impl JsonRpcRequestProcessor {
         origin: ScanOrigin,
     ) -> ScanResult<NonCirculatingSupply> {
         let bank = Arc::clone(bank);
-        self.runtime
-            .spawn_blocking(move || calculate_non_circulating_supply(&bank, origin))
-            .await
-            .expect("Failed to spawn blocking task")
+        let abort_token = Arc::new(AtomicBool::new(false));
+        let mut abort_guard = GetSupplyAbortGuard::new(Arc::clone(&abort_token));
+        let abort_token_for_worker = Arc::clone(&abort_token);
+        let join_handle = self.runtime.spawn_blocking(move || {
+            #[cfg(test)]
+            run_get_supply_non_circulating_hook(&bank, Arc::clone(&abort_token_for_worker));
+            calculate_non_circulating_supply_with_abort(
+                &bank,
+                Some(abort_token_for_worker),
+                origin,
+            )
+        });
+        let result = join_handle.await;
+        abort_guard.disarm();
+        result.expect("Failed to spawn blocking task")
     }
 
     pub async fn get_filtered_indexed_accounts(
@@ -5921,6 +5991,132 @@ pub mod tests {
             }
         };
         assert_eq!(result.value, expected);
+    }
+
+    #[tokio::test]
+    async fn test_get_supply_aborts_before_worker_starts() {
+        let rpc = RpcHandler::start_with_config(JsonRpcConfig {
+            rpc_blocking_threads: 1,
+            ..JsonRpcConfig::default()
+        });
+        let bank_id = rpc.working_bank().bank_id();
+        let (worker_tx, worker_rx) = tokio::sync::oneshot::channel();
+        let (hook_release_tx, hook_release_rx) = tokio::sync::oneshot::channel();
+        let (hook_done_tx, hook_done_rx) = tokio::sync::oneshot::channel();
+        install_get_supply_non_circulating_hook(
+            bank_id,
+            Box::new(move |abort| {
+                worker_tx.send(Arc::clone(&abort)).unwrap();
+                hook_release_rx.blocking_recv().unwrap();
+                hook_done_tx.send(abort.load(Ordering::Relaxed)).unwrap();
+            }),
+        );
+
+        let (blocker_started_tx, blocker_started_rx) = tokio::sync::oneshot::channel();
+        let (blocker_release_tx, blocker_release_rx) = tokio::sync::oneshot::channel();
+        let blocker = rpc.meta.runtime.spawn_blocking(move || {
+            blocker_started_tx.send(()).unwrap();
+            blocker_release_rx.blocking_recv().unwrap();
+        });
+        blocker_started_rx.await.unwrap();
+
+        let meta = rpc.meta.clone();
+        let request = tokio::spawn(async move { meta.get_supply(None).await });
+        tokio::task::yield_now().await;
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+
+        blocker_release_tx.send(()).unwrap();
+        blocker.await.unwrap();
+        let abort = worker_rx.await.unwrap();
+        assert!(abort.load(Ordering::Relaxed));
+        hook_release_tx.send(()).unwrap();
+        assert!(hook_done_rx.await.unwrap());
+
+        tokio::task::spawn_blocking(move || drop(rpc))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_get_supply_aborts_during_fallback_scan() {
+        let mut indexes = HashSet::new();
+        indexes.insert(solana_accounts_db::accounts_index::AccountIndex::ProgramId);
+        let rpc = RpcHandler::start_with_config(JsonRpcConfig {
+            account_indexes: AccountSecondaryIndexes {
+                keys: Some(
+                    solana_accounts_db::accounts_index::AccountSecondaryIndexesIncludeExclude {
+                        exclude: false,
+                        keys: HashSet::new(),
+                    },
+                ),
+                indexes,
+            },
+            ..JsonRpcConfig::default()
+        });
+        let bank = rpc.working_bank();
+        let stake_program_id = solana_stake_interface::program::id();
+        let account = AccountSharedData::new(1, 0, &stake_program_id);
+        for _ in 0..10_000 {
+            bank.store_account(&Pubkey::new_unique(), &account);
+        }
+        bank.force_flush_accounts_cache();
+        assert!(bank
+            .rc
+            .accounts
+            .accounts_db
+            .account_indexes
+            .contains(&solana_accounts_db::accounts_index::AccountIndex::ProgramId));
+        assert!(!bank.account_indexes_include_key(&stake_program_id));
+
+        let bank_id = bank.bank_id();
+        let (token_tx, token_rx) = tokio::sync::oneshot::channel();
+        install_get_supply_non_circulating_hook(
+            bank_id,
+            Box::new(move |abort| {
+                token_tx.send(abort).unwrap();
+            }),
+        );
+        let baseline = bank
+            .rc
+            .accounts
+            .accounts_db
+            .scan_tracker
+            .active_scans
+            .load(Ordering::Relaxed);
+        let meta = rpc.meta.clone();
+        let request = tokio::spawn(async move { meta.get_supply(None).await });
+        let abort = token_rx.await.unwrap();
+        while bank
+            .rc
+            .accounts
+            .accounts_db
+            .scan_tracker
+            .active_scans
+            .load(Ordering::Relaxed)
+            == baseline
+        {
+            tokio::task::yield_now().await;
+        }
+
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        assert!(abort.load(Ordering::Relaxed));
+        while bank
+            .rc
+            .accounts
+            .accounts_db
+            .scan_tracker
+            .active_scans
+            .load(Ordering::Relaxed)
+            != baseline
+        {
+            tokio::task::yield_now().await;
+        }
+
+        tokio::task::spawn_blocking(move || drop(rpc))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
