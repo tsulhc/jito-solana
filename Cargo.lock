@@ -10421,6 +10421,7 @@ dependencies = [
  "stream-cancel",
  "symlink",
  "test-case",
+ "thiserror 2.0.18",
  "thiserror 2.0.19",
  "tokio",
  "tokio-util 0.7.19",

@@ -136,6 +136,7 @@ use {
     solana_message::{
         AccountKeys, SanitizedMessage, VersionedMessage, inner_instruction::InnerInstructions,
     },
+    solana_metrics::ScanOrigin,
     solana_packet::PACKET_DATA_SIZE,
     solana_precompile_error::PrecompileError,
     solana_program_runtime::{
@@ -5454,22 +5455,38 @@ impl Bank {
     pub fn get_program_accounts(
         &self,
         program_id: &Pubkey,
+        origin: ScanOrigin,
     ) -> ScanResult<Vec<KeyedAccountSharedData>> {
-        self.rc
-            .accounts
-            .load_by_program(&self.ancestors, self.bank_id, program_id)
+        self.get_program_accounts_with_abort(program_id, None, origin)
+    }
+
+    pub fn get_program_accounts_with_abort(
+        &self,
+        program_id: &Pubkey,
+        abort: Option<Arc<AtomicBool>>,
+        origin: ScanOrigin,
+    ) -> ScanResult<Vec<KeyedAccountSharedData>> {
+        self.rc.accounts.load_by_program_with_abort(
+            &self.ancestors,
+            self.bank_id,
+            program_id,
+            abort,
+            origin,
+        )
     }
 
     pub fn get_filtered_program_accounts<F: Fn(&AccountSharedData) -> bool>(
         &self,
         program_id: &Pubkey,
         filter: F,
+        origin: ScanOrigin,
     ) -> ScanResult<Vec<KeyedAccountSharedData>> {
         self.rc.accounts.load_by_program_with_filter(
             &self.ancestors,
             self.bank_id,
             program_id,
             filter,
+            origin,
         )
     }
 
@@ -5478,13 +5495,33 @@ impl Bank {
         index_key: &IndexKey,
         filter: F,
         byte_limit_for_scan: Option<usize>,
+        origin: ScanOrigin,
     ) -> ScanResult<Vec<KeyedAccountSharedData>> {
-        self.rc.accounts.load_by_index_key_with_filter(
+        self.get_filtered_indexed_accounts_with_abort(
+            index_key,
+            filter,
+            byte_limit_for_scan,
+            None,
+            origin,
+        )
+    }
+
+    pub fn get_filtered_indexed_accounts_with_abort<F: Fn(&AccountSharedData) -> bool>(
+        &self,
+        index_key: &IndexKey,
+        filter: F,
+        byte_limit_for_scan: Option<usize>,
+        abort: Option<Arc<AtomicBool>>,
+        origin: ScanOrigin,
+    ) -> ScanResult<Vec<KeyedAccountSharedData>> {
+        self.rc.accounts.load_by_index_key_with_filter_with_abort(
             &self.ancestors,
             self.bank_id,
             index_key,
             filter,
             byte_limit_for_scan,
+            abort,
+            origin,
         )
     }
 
@@ -5493,13 +5530,13 @@ impl Bank {
     }
 
     // Scans all the accounts this bank can load, applying `scan_func`
-    pub fn scan_all_accounts<F>(&self, scan_func: F) -> ScanResult<()>
+    pub fn scan_all_accounts<F>(&self, scan_func: F, origin: ScanOrigin) -> ScanResult<()>
     where
         F: FnMut(Option<(&Pubkey, AccountSharedData, Slot)>),
     {
         self.rc
             .accounts
-            .scan_all(&self.ancestors, self.bank_id, scan_func)
+            .scan_all(&self.ancestors, self.bank_id, scan_func, origin)
     }
 
     pub fn get_program_accounts_modified_since_parent(
@@ -5545,6 +5582,8 @@ impl Bank {
         num: usize,
         filter_by_address: &HashSet<Pubkey>,
         filter: AccountAddressFilter,
+        origin: ScanOrigin,
+        abort: Option<Arc<AtomicBool>>,
     ) -> ScanResult<Vec<(Pubkey, u64)>> {
         self.rc.accounts.load_largest_accounts(
             &self.ancestors,
@@ -5552,6 +5591,8 @@ impl Bank {
             num,
             filter_by_address,
             filter,
+            abort,
+            origin,
         )
     }
 
@@ -6862,14 +6903,17 @@ impl Bank {
     /// Only intended to be called by tests or when the number of accounts is small.
     pub fn calculate_accounts_data_size(&self) -> ScanResult<u64> {
         let mut accounts_data_size: u64 = 0;
-        self.scan_all_accounts(|address_account_slot| {
-            let Some((_address, account, _slot)) = address_account_slot else {
-                return;
-            };
-            accounts_data_size = accounts_data_size
-                .checked_add(account.data().len() as u64)
-                .expect("accounts data size cannot overflow");
-        })?;
+        self.scan_all_accounts(
+            |address_account_slot| {
+                let Some((_address, account, _slot)) = address_account_slot else {
+                    return;
+                };
+                accounts_data_size = accounts_data_size
+                    .checked_add(account.data().len() as u64)
+                    .expect("accounts data size cannot overflow");
+            },
+            ScanOrigin::AccountsDataSizeCalculation,
+        )?;
         Ok(accounts_data_size)
     }
 
