@@ -39,10 +39,13 @@ jobs:
       - name: Formatting (changed Rust files only)
         shell: bash
         run: |
-          # The upstream v4.3.2 release already has unrelated formatting drift.
-          # Normalize the checkout and require our changed Rust files to remain unchanged.
+          # Check the complete PR diff without enforcing unrelated upstream formatting drift.
+          git fetch --no-tags origin v4.3.2-jito --depth=1
+          mapfile -t changed < <(git diff --name-only --diff-filter=ACMR FETCH_HEAD HEAD -- '*.rs')
           cargo fmt --all
-          git diff --exit-code -- $(git diff --name-only HEAD^ HEAD -- '*.rs')
+          if (( ${#changed[@]} )); then
+            git diff --exit-code -- "${changed[@]}"
+          fi
       - name: Check changed runtime and validator crates
         run: cargo check -p solana-metrics -p solana-accounts-db -p solana-runtime -p solana-rpc -p agave-validator
       - name: Targeted tests
