@@ -1608,7 +1608,7 @@ mod tests {
 
     #[test]
     fn test_load_largest_accounts_aborted_scan_returns_error() {
-        let accounts_db = AccountsDb::new_single_for_tests();
+        let accounts_db = AccountsDb::default_for_tests();
         let accounts = Accounts::new(Arc::new(accounts_db));
         let pubkey = Pubkey::new_unique();
         accounts.store_for_tests(
@@ -1655,10 +1655,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let accounts_db = AccountsDb::new_single_for_tests_with_provider_and_config(
-            crate::accounts_file::AccountsFileProvider::default(),
-            accounts_db_config,
-        );
+        let accounts_db = AccountsDb::new_for_tests_with_config(Vec::new(), accounts_db_config);
         let accounts = Accounts::new(Arc::new(accounts_db));
         for _ in 0..4 {
             accounts.store_for_tests(
