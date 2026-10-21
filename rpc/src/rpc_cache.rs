@@ -100,12 +100,14 @@ enum GenerationState {
     Terminal = 3,
 }
 
+pub(crate) type LargestAccountsWatchValue = Option<Result<(u64, Vec<RpcAccountBalance>), String>>;
+
 pub(crate) struct InflightEntry {
-    pub(crate) sender: watch::Sender<Option<Result<(u64, Vec<RpcAccountBalance>), String>>>,
+    pub(crate) sender: watch::Sender<LargestAccountsWatchValue>,
     // Keep one receiver alive so `sender.send` always updates the stored value even if
     // waiters have not yet subscribed. Without this, `watch::Sender::send` fails when
     // receiver count is 0 and the value is not updated, causing deadlock.
-    _receiver: watch::Receiver<Option<Result<(u64, Vec<RpcAccountBalance>), String>>>,
+    _receiver: watch::Receiver<LargestAccountsWatchValue>,
     abort: Arc<AtomicBool>,
     state: AtomicU8,
     waiters: AtomicUsize,

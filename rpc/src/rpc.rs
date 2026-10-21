@@ -1366,8 +1366,7 @@ impl JsonRpcRequestProcessor {
                     lease.mark_completed();
                     return Err(RpcCustomError::ScanError {
                         message: "largest accounts generation aborted".to_string(),
-                    }
-                    .into());
+                    });
                 }
                 // Spawn owned runtime task for the producer job. The job is owned by the
                 // coordinator/runtime, not by the HTTP/RPC future that first observed the miss.
@@ -1485,7 +1484,7 @@ impl JsonRpcRequestProcessor {
                     context: RpcResponseContext::new(slot),
                     value: accounts,
                 }),
-                Err(msg) => Err(RpcCustomError::ScanError { message: msg }.into()),
+                Err(msg) => Err(RpcCustomError::ScanError { message: msg }),
             };
         }
     }
