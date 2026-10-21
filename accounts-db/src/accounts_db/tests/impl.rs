@@ -14,9 +14,9 @@ use {
         Account, AccountSharedData, DUMMY_INHERITABLE_ACCOUNT_FIELDS, InheritableAccountFields,
         WritableAccount as _, accounts_equal,
     },
-    solana_lattice_hash::lt_hash::Checksum as LtHashChecksum,
     solana_clock::Slot,
     solana_lattice_hash::lt_hash::Checksum as LtHashChecksum,
+    solana_metrics::ScanOrigin,
     solana_pubkey::{PUBKEY_BYTES, Pubkey},
     std::{
         collections::{HashMap, HashSet},
