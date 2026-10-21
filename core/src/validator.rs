@@ -342,6 +342,7 @@ pub struct ValidatorConfig {
     pub on_start_geyser_plugin_config_files: Option<Vec<PathBuf>>,
     pub geyser_plugin_always_enabled: bool,
     pub rpc_addrs: Option<(SocketAddr, SocketAddr)>, // (JsonRpc, JsonRpcPubSub)
+    pub metrics_addr: Option<SocketAddr>,
     pub pubsub_config: PubSubConfig,
     pub snapshot_config: SnapshotConfig,
     pub blockstore_cleanup_strategy: BlockstoreCleanupStrategy,
@@ -449,6 +450,7 @@ impl ValidatorConfig {
             on_start_geyser_plugin_config_files: None,
             geyser_plugin_always_enabled: false,
             rpc_addrs: None,
+            metrics_addr: None,
             pubsub_config: PubSubConfig::default_for_tests(),
             snapshot_config: SnapshotConfig::new_load_only(),
             broadcast_stage_type: BroadcastStageType::Standard,
@@ -1345,6 +1347,7 @@ impl Validator {
             };
             let rpc_svc_config = JsonRpcServiceConfig {
                 rpc_addr,
+                metrics_addr: config.metrics_addr,
                 rpc_config: config.rpc_config.clone(),
                 snapshot_config: Some(snapshot_controller.snapshot_config().clone()),
                 bank_forks: bank_forks.clone(),

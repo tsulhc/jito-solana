@@ -1,0 +1,59 @@
+name: Fork validator integration checks
+
+on:
+  pull_request:
+    branches:
+      - v4.3.2-jito
+    paths:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - Cargo.lock
+      - ".github/workflows/kleomedes-rust-check.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-rust-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  patched-validator:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+          fetch-depth: 2
+      - name: Install Rust and native dependencies
+        shell: bash
+        run: |
+          source .github/scripts/install-all-deps.sh Linux
+          source ci/rust-version.sh stable
+          rustup component add rustfmt clippy
+      - name: Formatting (changed Rust files only)
+        shell: bash
+        run: |
+          # Check the complete PR diff without enforcing unrelated upstream formatting drift.
+          git fetch --no-tags origin v4.3.2-jito --depth=1
+          mapfile -t changed < <(git diff --name-only --diff-filter=ACMR FETCH_HEAD HEAD -- '*.rs')
+          cargo fmt --all
+          if (( ${#changed[@]} )); then
+            git diff --exit-code -- "${changed[@]}"
+          fi
+      - name: Check changed runtime and validator crates
+        run: cargo check -p solana-metrics -p solana-accounts-db -p solana-runtime -p solana-rpc -p agave-validator
+      - name: Targeted tests
+        shell: bash
+        run: |
+          cargo test -p solana-metrics --lib scan
+          cargo test -p solana-accounts-db --lib scan
+          cargo test -p solana-rpc --lib test_largest_accounts
+          cargo test -p solana-rpc --lib get_supply
+      - name: Clippy
+        run: cargo clippy -p solana-metrics -p solana-accounts-db -p solana-runtime -p solana-rpc -p agave-validator -- -D warnings
