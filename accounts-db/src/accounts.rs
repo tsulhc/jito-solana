@@ -1645,10 +1645,12 @@ mod tests {
         indexes.insert(crate::accounts_index::AccountIndex::ProgramId);
         let accounts_db_config = crate::accounts_db::AccountsDbConfig {
             account_indexes: Some(crate::accounts_index::AccountSecondaryIndexes {
-                keys: Some(crate::accounts_index::AccountSecondaryIndexesIncludeExclude {
-                    exclude: false,
-                    keys: indexed_keys,
-                }),
+                keys: Some(
+                    crate::accounts_index::AccountSecondaryIndexesIncludeExclude {
+                        exclude: false,
+                        keys: indexed_keys,
+                    },
+                ),
                 indexes,
             }),
             ..Default::default()
@@ -1667,14 +1669,18 @@ mod tests {
         }
         accounts.add_root_and_flush_write_cache(0);
 
-        assert!(accounts
-            .accounts_db
-            .account_indexes
-            .contains(&crate::accounts_index::AccountIndex::ProgramId));
-        assert!(!accounts
-            .accounts_db
-            .account_indexes
-            .include_key(&stake_program_id));
+        assert!(
+            accounts
+                .accounts_db
+                .account_indexes
+                .contains(&crate::accounts_index::AccountIndex::ProgramId)
+        );
+        assert!(
+            !accounts
+                .accounts_db
+                .account_indexes
+                .include_key(&stake_program_id)
+        );
 
         let abort = Arc::new(AtomicBool::new(false));
         let abort_for_callback = Arc::clone(&abort);
