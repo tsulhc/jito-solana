@@ -2501,7 +2501,7 @@ impl AccountsDb {
         F: FnMut(Option<(&Pubkey, AccountSharedData, Slot)>),
     {
         // Register this scan so that slots needed by the scan are not cleaned out from under us.
-        let scan_guard =
+        let mut scan_guard =
             ScanGuard::try_new(&self.scan_tracker, bank_id, || self.max_root(), origin).ok_or(
                 ScanError::SlotRemoved {
                     slot: ancestors.max_slot(),
@@ -2611,7 +2611,7 @@ impl AccountsDb {
         }
 
         // Register this scan so that slots needed by the scan are not cleaned out from under us.
-        let scan_guard =
+        let mut scan_guard =
             ScanGuard::try_new(&self.scan_tracker, bank_id, || self.max_root(), origin).ok_or(
                 ScanError::SlotRemoved {
                     slot: ancestors.max_slot(),
