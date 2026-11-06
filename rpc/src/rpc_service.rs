@@ -81,18 +81,18 @@ impl Drop for RpcInFlightGuard {
     }
 }
 
-impl Middleware<JsonRpcRequestProcessor> for RpcMetricsMiddleware {
+impl<M: jsonrpc_core::Metadata> Middleware<M> for RpcMetricsMiddleware {
     type Future = Pin<Box<dyn Future<Output = Option<jsonrpc_core::Response>> + Send>>;
     type CallFuture = Pin<Box<dyn Future<Output = Option<jsonrpc_core::Output>> + Send>>;
 
     fn on_call<F, X>(
         &self,
         call: Call,
-        meta: JsonRpcRequestProcessor,
+        meta: M,
         next: F,
     ) -> jsonrpc_core::futures::future::Either<Self::CallFuture, X>
     where
-        F: Fn(Call, JsonRpcRequestProcessor) -> X + Send + Sync,
+        F: Fn(Call, M) -> X + Send + Sync,
         X: Future<Output = Option<jsonrpc_core::Output>> + Send + 'static,
     {
         let method = match &call {
@@ -125,23 +125,23 @@ impl Middleware<JsonRpcRequestProcessor> for RpcMetricsMiddleware {
 #[derive(Clone, Default)]
 struct RpcMiddleware;
 
-impl Middleware<JsonRpcRequestProcessor> for RpcMiddleware {
-    type Future = <RpcMetricsMiddleware as Middleware<JsonRpcRequestProcessor>>::Future;
-    type CallFuture = <RpcMetricsMiddleware as Middleware<JsonRpcRequestProcessor>>::CallFuture;
+impl<M: jsonrpc_core::Metadata> Middleware<M> for RpcMiddleware {
+    type Future = <RpcMetricsMiddleware as Middleware<M>>::Future;
+    type CallFuture = <RpcMetricsMiddleware as Middleware<M>>::CallFuture;
 
     fn on_request<F, X>(
         &self,
         request: jsonrpc_core::Request,
-        meta: JsonRpcRequestProcessor,
+        meta: M,
         next: F,
     ) -> jsonrpc_core::futures::future::Either<Self::Future, X>
     where
-        F: Fn(jsonrpc_core::Request, JsonRpcRequestProcessor) -> X + Send + Sync,
+        F: Fn(jsonrpc_core::Request, M) -> X + Send + Sync,
         X: Future<Output = Option<jsonrpc_core::Response>> + Send + 'static,
     {
         match SimulateBundleBatchLimit.on_request(request, meta, next) {
-            jsonrpc_core::futures::future::Either::Left(_) => {
-                jsonrpc_core::futures::future::Either::Left(Box::pin(async { None }))
+            jsonrpc_core::futures::future::Either::Left(future) => {
+                jsonrpc_core::futures::future::Either::Left(future)
             }
             jsonrpc_core::futures::future::Either::Right(future) => {
                 jsonrpc_core::futures::future::Either::Right(future)
@@ -152,11 +152,11 @@ impl Middleware<JsonRpcRequestProcessor> for RpcMiddleware {
     fn on_call<F, X>(
         &self,
         call: Call,
-        meta: JsonRpcRequestProcessor,
+        meta: M,
         next: F,
     ) -> jsonrpc_core::futures::future::Either<Self::CallFuture, X>
     where
-        F: Fn(Call, JsonRpcRequestProcessor) -> X + Send + Sync,
+        F: Fn(Call, M) -> X + Send + Sync,
         X: Future<Output = Option<jsonrpc_core::Output>> + Send + 'static,
     {
         RpcMetricsMiddleware.on_call(call, meta, next)
@@ -1162,6 +1162,65 @@ mod tests {
         );
         rpc_service.exit();
         rpc_service.join().unwrap();
+    }
+
+    #[test]
+    fn test_rpc_middleware_preserves_limited_batch_response() {
+        use {
+            crate::rpc_batch_limit::MAX_SIMULATE_BUNDLE_CALLS_PER_BATCH as MAX,
+            jsonrpc_core::{MetaIoHandler, Value},
+            std::sync::atomic::AtomicUsize,
+        };
+
+        let simulate_calls = Arc::new(AtomicUsize::default());
+        let ping_calls = Arc::new(AtomicUsize::default());
+        let mut io = MetaIoHandler::with_middleware(RpcMiddleware);
+
+        let simulate_calls_for_method = Arc::clone(&simulate_calls);
+        io.add_method("simulateBundle", move |_| {
+            simulate_calls_for_method.fetch_add(1, Ordering::Relaxed);
+            async { Ok(Value::from("simulated")) }
+        });
+        let ping_calls_for_method = Arc::clone(&ping_calls);
+        io.add_method("ping", move |_| {
+            ping_calls_for_method.fetch_add(1, Ordering::Relaxed);
+            async { Ok(Value::from("pong")) }
+        });
+
+        let mut batch: Vec<_> = (0..=MAX)
+            .map(|id| {
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "simulateBundle",
+                })
+            })
+            .collect();
+        batch.push(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": MAX + 1,
+            "method": "ping",
+        }));
+
+        let response = io
+            .handle_request_sync(&serde_json::Value::from(batch).to_string(), ())
+            .expect("batch response");
+        let response: Vec<serde_json::Value> =
+            serde_json::from_str(&response).expect("batch response JSON");
+
+        assert_eq!(response.len(), MAX + 2);
+        let rejected: Vec<_> = response
+            .iter()
+            .filter(|output| {
+                output["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.starts_with("Too many simulateBundle calls"))
+            })
+            .collect();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(response.last().unwrap()["result"], "pong");
+        assert_eq!(simulate_calls.load(Ordering::Relaxed), MAX);
+        assert_eq!(ping_calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

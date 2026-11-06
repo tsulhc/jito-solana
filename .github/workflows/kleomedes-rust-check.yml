@@ -53,6 +53,7 @@ jobs:
         run: |
           cargo test -p solana-metrics --lib scan
           cargo test -p solana-accounts-db --lib scan
+          cargo test -p solana-rpc --lib rpc_batch_limit
           cargo test -p solana-rpc --lib test_largest_accounts
           cargo test -p solana-rpc --lib get_supply
       - name: Clippy
