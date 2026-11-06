@@ -731,6 +731,7 @@ fn test_remove_unrooted_slots_aborts_ongoing_scan(
             }
         },
         &ScanConfig::default(),
+        ScanOrigin::Other,
     );
     assert_eq!(result, expected_result);
     assert_eq!(visited, expected_visits);
@@ -775,6 +776,7 @@ fn test_index_scan_accounts_aborts_when_bank_removed() {
             }
         },
         &ScanConfig::default(),
+        ScanOrigin::Other,
     );
     assert_eq!(result, Err(ScanError::SlotRemoved { slot, bank_id }));
     // Guarantee that the abort occurred without visiting all pubkeys
