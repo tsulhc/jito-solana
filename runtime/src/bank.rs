@@ -143,8 +143,8 @@ use {
     solana_message::{
         AccountKeys, SanitizedMessage, inner_instruction::InnerInstructions, v0::LoadedAddresses,
     },
-    solana_nonce_account::verify_nonce_account,
     solana_metrics::ScanOrigin,
+    solana_nonce_account::verify_nonce_account,
     solana_packet::PACKET_DATA_SIZE,
     solana_precompile_error::PrecompileError,
     solana_program_runtime::{

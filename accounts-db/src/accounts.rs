@@ -639,8 +639,8 @@ mod tests {
         solana_runtime_transaction::runtime_transaction::RuntimeTransaction,
         solana_sdk_ids::native_loader,
         solana_signer::{Signer, signers::Signers},
-        solana_svm_transaction::svm_message::SVMMessage,
         solana_stake_interface::program as stake_program,
+        solana_svm_transaction::svm_message::SVMMessage,
         solana_transaction::{Transaction, sanitized::MAX_TX_ACCOUNT_LOCKS},
         solana_transaction_error::TransactionError,
         std::{

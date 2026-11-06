@@ -404,8 +404,10 @@ mod tests {
     #[test]
     fn test_is_bank_removed_only_for_removed_bank() {
         let tracker = ScanTracker::default();
-        let mut guard_on_removed_bank = ScanGuard::try_new(&tracker, 1, || 10, ScanOrigin::Other).unwrap();
-        let mut guard_on_other_bank = ScanGuard::try_new(&tracker, 2, || 10, ScanOrigin::Other).unwrap();
+        let mut guard_on_removed_bank =
+            ScanGuard::try_new(&tracker, 1, || 10, ScanOrigin::Other).unwrap();
+        let mut guard_on_other_bank =
+            ScanGuard::try_new(&tracker, 2, || 10, ScanOrigin::Other).unwrap();
         assert!(!guard_on_removed_bank.is_bank_removed());
         assert!(!guard_on_other_bank.is_bank_removed());
 

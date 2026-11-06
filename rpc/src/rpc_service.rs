@@ -122,7 +122,6 @@ impl Middleware<JsonRpcRequestProcessor> for RpcMetricsMiddleware {
     }
 }
 
-
 #[derive(Clone, Default)]
 struct RpcMiddleware;
 
