@@ -99,6 +99,7 @@ use {
         Message, MessageHeader, SanitizedMessage, VersionedMessage,
         compiled_instruction::CompiledInstruction, v0, v1,
     },
+    solana_metrics::ScanOrigin,
     solana_native_token::LAMPORTS_PER_SOL,
     solana_nonce::{self as nonce, state::DurableNonce},
     solana_packet::PACKET_DATA_SIZE,
@@ -3488,17 +3489,20 @@ fn test_bank_get_program_accounts() {
     let mut found_mint = false;
     let mut found_sysvar = false;
     parent
-        .scan_all_accounts(|address_account_slot| {
-            let Some((pubkey, account, _slot)) = address_account_slot else {
-                return;
-            };
-            if *pubkey == mint_keypair.pubkey() {
-                found_mint = true;
-            }
-            if solana_sdk_ids::sysvar::check_id(account.owner()) {
-                found_sysvar = true;
-            }
-        })
+        .scan_all_accounts(
+            |address_account_slot| {
+                let Some((pubkey, account, _slot)) = address_account_slot else {
+                    return;
+                };
+                if *pubkey == mint_keypair.pubkey() {
+                    found_mint = true;
+                }
+                if solana_sdk_ids::sysvar::check_id(account.owner()) {
+                    found_sysvar = true;
+                }
+            },
+            ScanOrigin::Other,
+        )
         .unwrap();
     assert!(found_mint);
     assert!(found_sysvar);
@@ -3517,11 +3521,15 @@ fn test_bank_get_program_accounts() {
     let bank1 = Arc::new(new_from_parent(bank0.clone()));
     bank1.squash();
     assert_eq!(
-        bank0.get_program_accounts(&program_id).unwrap(),
+        bank0
+            .get_program_accounts(&program_id, ScanOrigin::Other)
+            .unwrap(),
         vec![(pubkey0, account0.clone())]
     );
     assert_eq!(
-        bank1.get_program_accounts(&program_id).unwrap(),
+        bank1
+            .get_program_accounts(&program_id, ScanOrigin::Other)
+            .unwrap(),
         vec![(pubkey0, account0)]
     );
     assert_eq!(
@@ -3540,8 +3548,20 @@ fn test_bank_get_program_accounts() {
 
     let bank3 = Arc::new(new_from_parent(bank2));
     bank3.squash();
-    assert_eq!(bank1.get_program_accounts(&program_id).unwrap().len(), 2);
-    assert_eq!(bank3.get_program_accounts(&program_id).unwrap().len(), 2);
+    assert_eq!(
+        bank1
+            .get_program_accounts(&program_id, ScanOrigin::Other)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        bank3
+            .get_program_accounts(&program_id, ScanOrigin::Other)
+            .unwrap()
+            .len(),
+        2
+    );
 }
 
 #[test]
@@ -3573,6 +3593,7 @@ fn test_get_filtered_indexed_accounts_limit_exceeded() {
             &IndexKey::ProgramId(program_id),
             |_| true,
             Some(limit), // limit here will be exceeded, resulting in aborted scan
+            ScanOrigin::Other,
         )
         .is_err()
     );
@@ -3599,7 +3620,12 @@ fn test_get_filtered_indexed_accounts() {
     bank.store_account(&address, &account);
 
     let indexed_accounts = bank
-        .get_filtered_indexed_accounts(&IndexKey::ProgramId(program_id), |_| true, None)
+        .get_filtered_indexed_accounts(
+            &IndexKey::ProgramId(program_id),
+            |_| true,
+            None,
+            ScanOrigin::Other,
+        )
         .unwrap();
     assert_eq!(indexed_accounts.len(), 1);
     assert_eq!(indexed_accounts[0], (address, account));
@@ -3617,12 +3643,22 @@ fn test_get_filtered_indexed_accounts() {
     );
     bank.store_account(&address, &new_account);
     let indexed_accounts = bank
-        .get_filtered_indexed_accounts(&IndexKey::ProgramId(program_id), |_| true, None)
+        .get_filtered_indexed_accounts(
+            &IndexKey::ProgramId(program_id),
+            |_| true,
+            None,
+            ScanOrigin::Other,
+        )
         .unwrap();
     assert_eq!(indexed_accounts.len(), 1);
     assert_eq!(indexed_accounts[0], (address, new_account.clone()));
     let indexed_accounts = bank
-        .get_filtered_indexed_accounts(&IndexKey::ProgramId(another_program_id), |_| true, None)
+        .get_filtered_indexed_accounts(
+            &IndexKey::ProgramId(another_program_id),
+            |_| true,
+            None,
+            ScanOrigin::Other,
+        )
         .unwrap();
     assert_eq!(indexed_accounts.len(), 1);
     assert_eq!(indexed_accounts[0], (address, new_account.clone()));
@@ -3633,6 +3669,7 @@ fn test_get_filtered_indexed_accounts() {
             &IndexKey::ProgramId(program_id),
             |account| account.owner() == &program_id,
             None,
+            ScanOrigin::Other,
         )
         .unwrap();
     assert!(indexed_accounts.is_empty());
@@ -3641,6 +3678,7 @@ fn test_get_filtered_indexed_accounts() {
             &IndexKey::ProgramId(another_program_id),
             |account| account.owner() == &another_program_id,
             None,
+            ScanOrigin::Other,
         )
         .unwrap();
     assert_eq!(indexed_accounts.len(), 1);
@@ -7988,7 +8026,8 @@ fn test_store_scan_consistency<F>(
                         bank_to_scan_receiver.recv_timeout(Duration::from_millis(10))
                     {
                         info!("scanning program accounts for slot {}", bank_to_scan.slot());
-                        let accounts_result = bank_to_scan.get_program_accounts(&program_id);
+                        let accounts_result =
+                            bank_to_scan.get_program_accounts(&program_id, ScanOrigin::Other);
                         match scan_finished_sender.try_send(bank_to_scan.bank_id()) {
                             // The receiver may have hung up during shutdown; that's fine.
                             Ok(()) | Err(TrySendError::Disconnected(_)) => {}
@@ -9121,24 +9160,48 @@ fn test_get_largest_accounts() {
 
     // Return only one largest account
     assert_eq!(
-        bank.get_largest_accounts(1, &pubkeys_hashset, AccountAddressFilter::Include)
-            .unwrap(),
+        bank.get_largest_accounts(
+            1,
+            &pubkeys_hashset,
+            AccountAddressFilter::Include,
+            ScanOrigin::Other,
+            None,
+        )
+        .unwrap(),
         vec![(pubkeys[4], 500 * LAMPORTS_PER_SOL)]
     );
     assert_eq!(
-        bank.get_largest_accounts(1, &exclude_hashset, AccountAddressFilter::Exclude)
-            .unwrap(),
+        bank.get_largest_accounts(
+            1,
+            &exclude_hashset,
+            AccountAddressFilter::Exclude,
+            ScanOrigin::Other,
+            None,
+        )
+        .unwrap(),
         vec![(pubkeys[4], 500 * LAMPORTS_PER_SOL)]
     );
     assert_eq!(
-        bank.get_largest_accounts(1, &exclude4, AccountAddressFilter::Exclude)
-            .unwrap(),
+        bank.get_largest_accounts(
+            1,
+            &exclude4,
+            AccountAddressFilter::Exclude,
+            ScanOrigin::Other,
+            None,
+        )
+        .unwrap(),
         vec![(pubkeys[3], 400 * LAMPORTS_PER_SOL)]
     );
 
     // Return all added accounts
     let results = bank
-        .get_largest_accounts(10, &pubkeys_hashset, AccountAddressFilter::Include)
+        .get_largest_accounts(
+            10,
+            &pubkeys_hashset,
+            AccountAddressFilter::Include,
+            ScanOrigin::Other,
+            None,
+        )
         .unwrap();
     assert_eq!(results.len(), sorted_accounts.len());
     for pubkey_balance in sorted_accounts.iter() {
@@ -9150,7 +9213,13 @@ fn test_get_largest_accounts() {
 
     let expected_accounts = sorted_accounts[1..].to_vec();
     let results = bank
-        .get_largest_accounts(10, &exclude4, AccountAddressFilter::Exclude)
+        .get_largest_accounts(
+            10,
+            &exclude4,
+            AccountAddressFilter::Exclude,
+            ScanOrigin::Other,
+            None,
+        )
         .unwrap();
     // results include 5 Bank builtins
     assert_eq!(results.len(), 10);
@@ -9164,7 +9233,13 @@ fn test_get_largest_accounts() {
     // Return 3 added accounts
     let expected_accounts = sorted_accounts[0..4].to_vec();
     let results = bank
-        .get_largest_accounts(4, &pubkeys_hashset, AccountAddressFilter::Include)
+        .get_largest_accounts(
+            4,
+            &pubkeys_hashset,
+            AccountAddressFilter::Include,
+            ScanOrigin::Other,
+            None,
+        )
         .unwrap();
     assert_eq!(results.len(), expected_accounts.len());
     for pubkey_balance in expected_accounts.iter() {
@@ -9173,7 +9248,13 @@ fn test_get_largest_accounts() {
 
     let expected_accounts = expected_accounts[1..4].to_vec();
     let results = bank
-        .get_largest_accounts(3, &exclude4, AccountAddressFilter::Exclude)
+        .get_largest_accounts(
+            3,
+            &exclude4,
+            AccountAddressFilter::Exclude,
+            ScanOrigin::Other,
+            None,
+        )
         .unwrap();
     assert_eq!(results.len(), expected_accounts.len());
     for pubkey_balance in expected_accounts.iter() {
@@ -9187,8 +9268,14 @@ fn test_get_largest_accounts() {
         .chain(exclude_hashset.iter().cloned())
         .collect();
     assert_eq!(
-        bank.get_largest_accounts(2, &exclude, AccountAddressFilter::Exclude)
-            .unwrap(),
+        bank.get_largest_accounts(
+            2,
+            &exclude,
+            AccountAddressFilter::Exclude,
+            ScanOrigin::Other,
+            None,
+        )
+        .unwrap(),
         vec![pubkeys_balances[3], pubkeys_balances[1]]
     );
 }

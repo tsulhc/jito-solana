@@ -16,6 +16,7 @@ use {
     },
     solana_clock::Slot,
     solana_lattice_hash::lt_hash::Checksum as LtHashChecksum,
+    solana_metrics::ScanOrigin,
     solana_pubkey::{PUBKEY_BYTES, Pubkey},
     std::{
         collections::{HashMap, HashSet},
@@ -250,6 +251,7 @@ fn test_accountsdb_latest_ancestor() {
             }
         },
         &ScanConfig::default(),
+        ScanOrigin::Other,
     )
     .expect("should scan accounts");
     assert_eq!(accounts, vec![account1]);
@@ -729,6 +731,7 @@ fn test_remove_unrooted_slots_aborts_ongoing_scan(
             }
         },
         &ScanConfig::default(),
+        ScanOrigin::Other,
     );
     assert_eq!(result, expected_result);
     assert_eq!(visited, expected_visits);
@@ -773,6 +776,7 @@ fn test_index_scan_accounts_aborts_when_bank_removed() {
             }
         },
         &ScanConfig::default(),
+        ScanOrigin::Other,
     );
     assert_eq!(result, Err(ScanError::SlotRemoved { slot, bank_id }));
     // Guarantee that the abort occurred without visiting all pubkeys
@@ -1851,6 +1855,7 @@ fn test_clean_old_with_both_normal_and_zero_lamport_accounts() {
                 found_accounts.insert(*account.unwrap().0);
             },
             &ScanConfig::default(),
+            ScanOrigin::Other,
         )
         .unwrap();
     assert_eq!(found_accounts.len(), 1);
@@ -1873,6 +1878,7 @@ fn test_clean_old_with_both_normal_and_zero_lamport_accounts() {
                     found_accounts.insert(*account.unwrap().0);
                 },
                 &ScanConfig::default(),
+                ScanOrigin::Other,
             )
             .unwrap();
         assert!(!used_index);
@@ -1893,6 +1899,7 @@ fn test_clean_old_with_both_normal_and_zero_lamport_accounts() {
                     found_accounts.insert(*account.unwrap().0);
                 },
                 &ScanConfig::default(),
+                ScanOrigin::Other,
             )
             .unwrap();
         assert!(used_index);
@@ -1925,6 +1932,7 @@ fn test_clean_old_with_both_normal_and_zero_lamport_accounts() {
                 found_accounts.push(*account.unwrap().0);
             },
             &ScanConfig::default(),
+            ScanOrigin::Other,
         )
         .unwrap();
     assert_eq!(found_accounts, vec![pubkey2]);
@@ -2184,6 +2192,7 @@ fn test_accountsdb_scan_accounts() {
             }
         },
         &ScanConfig::default(),
+        ScanOrigin::Other,
     )
     .expect("should scan accounts");
     assert_eq!(accounts, vec![account0]);
@@ -2199,6 +2208,7 @@ fn test_accountsdb_scan_accounts() {
             }
         },
         &ScanConfig::default(),
+        ScanOrigin::Other,
     )
     .expect("should scan accounts");
     assert_eq!(accounts.len(), 2);
@@ -3993,6 +4003,7 @@ fn setup_scan(
                     }
                 },
                 &ScanConfig::default(),
+                ScanOrigin::Other,
             )
             .unwrap();
         })
@@ -6824,6 +6835,7 @@ fn test_index_scan_accounts_excludes_roots_added_during_scan() {
             }
         },
         &ScanConfig::default(),
+        ScanOrigin::Other,
     )
     .unwrap();
 
