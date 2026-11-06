@@ -19,6 +19,7 @@ use {
     },
     solana_clock::{BankId, Slot},
     solana_message::v0::LoadedAddresses,
+    solana_metrics::ScanOrigin,
     solana_pubkey::Pubkey,
     solana_runtime_transaction::transaction_with_meta::TransactionWithMeta,
     solana_slot_hashes::SlotHashes,
@@ -31,7 +32,7 @@ use {
         collections::{BinaryHeap, HashMap, HashSet},
         sync::{
             Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
     },
 };
@@ -272,11 +273,14 @@ impl Accounts {
         num: usize,
         filter_by_address: &HashSet<Pubkey>,
         filter: AccountAddressFilter,
+        abort: Option<Arc<AtomicBool>>,
+        origin: ScanOrigin,
     ) -> ScanResult<Vec<(Pubkey, u64)>> {
         if num == 0 {
             return Ok(vec![]);
         }
         let mut account_balances = BinaryHeap::new();
+        let config = ScanConfig { abort };
         self.accounts_db.scan_accounts(
             ancestors,
             bank_id,
@@ -305,8 +309,14 @@ impl Accounts {
                     account_balances.push(Reverse((account.lamports(), *pubkey)));
                 }
             },
-            &ScanConfig::default(),
+            &config,
+            origin,
         )?;
+        if config.is_aborted() {
+            return Err(ScanError::Aborted(
+                "largest accounts scan aborted".to_string(),
+            ));
+        }
         Ok(account_balances
             .into_sorted_vec()
             .into_iter()
@@ -332,9 +342,23 @@ impl Accounts {
         ancestors: &Ancestors,
         bank_id: BankId,
         program_id: &Pubkey,
+        origin: ScanOrigin,
+    ) -> ScanResult<Vec<KeyedAccountSharedData>> {
+        self.load_by_program_with_abort(ancestors, bank_id, program_id, None, origin)
+    }
+
+    pub fn load_by_program_with_abort(
+        &self,
+        ancestors: &Ancestors,
+        bank_id: BankId,
+        program_id: &Pubkey,
+        abort: Option<Arc<AtomicBool>>,
+        origin: ScanOrigin,
     ) -> ScanResult<Vec<KeyedAccountSharedData>> {
         let mut collector = Vec::new();
-        self.accounts_db
+        let config = ScanConfig { abort };
+        let result = self
+            .accounts_db
             .scan_accounts(
                 ancestors,
                 bank_id,
@@ -343,9 +367,15 @@ impl Accounts {
                         account.owner() == program_id
                     })
                 },
-                &ScanConfig::default(),
+                &config,
+                origin,
             )
-            .map(|_| collector)
+            .map(|_| collector);
+        if config.is_aborted() {
+            Err(ScanError::Aborted("account scan aborted".to_string()))
+        } else {
+            result
+        }
     }
 
     pub fn load_by_program_with_filter<F: Fn(&AccountSharedData) -> bool>(
@@ -354,6 +384,7 @@ impl Accounts {
         bank_id: BankId,
         program_id: &Pubkey,
         filter: F,
+        origin: ScanOrigin,
     ) -> ScanResult<Vec<KeyedAccountSharedData>> {
         let mut collector = Vec::new();
         self.accounts_db
@@ -366,6 +397,7 @@ impl Accounts {
                     })
                 },
                 &ScanConfig::default(),
+                origin,
             )
             .map(|_| collector)
     }
@@ -393,17 +425,28 @@ impl Accounts {
         }
     }
 
+    fn maybe_abort_scan_with_byte_limit(
+        result: ScanResult<Vec<KeyedAccountSharedData>>,
+        config: &ScanConfig,
+        byte_limit_exceeded: &AtomicBool,
+    ) -> ScanResult<Vec<KeyedAccountSharedData>> {
+        if byte_limit_exceeded.load(Ordering::Relaxed) {
+            ScanResult::Err(ScanError::Aborted(
+                "The accumulated scan results exceeded the limit".to_string(),
+            ))
+        } else if config.is_aborted() {
+            ScanResult::Err(ScanError::Aborted("account scan aborted".to_string()))
+        } else {
+            result
+        }
+    }
+
+    #[cfg(test)]
     fn maybe_abort_scan(
         result: ScanResult<Vec<KeyedAccountSharedData>>,
         config: &ScanConfig,
     ) -> ScanResult<Vec<KeyedAccountSharedData>> {
-        if config.is_aborted() {
-            ScanResult::Err(ScanError::Aborted(
-                "The accumulated scan results exceeded the limit".to_string(),
-            ))
-        } else {
-            result
-        }
+        Self::maybe_abort_scan_with_byte_limit(result, config, &AtomicBool::new(false))
     }
 
     pub fn load_by_index_key_with_filter<F: Fn(&AccountSharedData) -> bool>(
@@ -413,10 +456,37 @@ impl Accounts {
         index_key: &IndexKey,
         filter: F,
         byte_limit_for_scan: Option<usize>,
+        origin: ScanOrigin,
+    ) -> ScanResult<Vec<KeyedAccountSharedData>> {
+        self.load_by_index_key_with_filter_with_abort(
+            ancestors,
+            bank_id,
+            index_key,
+            filter,
+            byte_limit_for_scan,
+            None,
+            origin,
+        )
+    }
+
+    pub fn load_by_index_key_with_filter_with_abort<F: Fn(&AccountSharedData) -> bool>(
+        &self,
+        ancestors: &Ancestors,
+        bank_id: BankId,
+        index_key: &IndexKey,
+        filter: F,
+        byte_limit_for_scan: Option<usize>,
+        abort: Option<Arc<AtomicBool>>,
+        origin: ScanOrigin,
     ) -> ScanResult<Vec<KeyedAccountSharedData>> {
         let sum = AtomicUsize::default();
-        let config = ScanConfig::default().recreate_with_abort();
+        let byte_limit_exceeded = Arc::new(AtomicBool::new(false));
+        let config = match abort {
+            Some(abort) => ScanConfig { abort: Some(abort) },
+            None => ScanConfig::default().recreate_with_abort(),
+        };
         let mut collector = Vec::new();
+        let byte_limit_exceeded_for_callback = Arc::clone(&byte_limit_exceeded);
         let result = self
             .accounts_db
             .index_scan_accounts(
@@ -434,15 +504,17 @@ impl Accounts {
                             )
                         {
                             // total size of results exceeds size limit, so abort scan
+                            byte_limit_exceeded_for_callback.store(true, Ordering::Relaxed);
                             config.abort();
                         }
                         use_account
                     });
                 },
                 &config,
+                origin,
             )
             .map(|_| collector);
-        Self::maybe_abort_scan(result, &config)
+        Self::maybe_abort_scan_with_byte_limit(result, &config, &byte_limit_exceeded)
     }
 
     pub fn account_indexes_include_key(&self, key: &Pubkey) -> bool {
@@ -454,12 +526,18 @@ impl Accounts {
         ancestors: &Ancestors,
         bank_id: BankId,
         scan_func: F,
+        origin: ScanOrigin,
     ) -> ScanResult<()>
     where
         F: FnMut(Option<(&Pubkey, AccountSharedData, Slot)>),
     {
-        self.accounts_db
-            .scan_accounts(ancestors, bank_id, scan_func, &ScanConfig::default())
+        self.accounts_db.scan_accounts(
+            ancestors,
+            bank_id,
+            scan_func,
+            &ScanConfig::default(),
+            origin,
+        )
     }
 
     /// This function will prevent multiple threads from modifying the same account state at the
@@ -562,6 +640,7 @@ mod tests {
         solana_sdk_ids::native_loader,
         solana_signer::{Signer, signers::Signers},
         solana_svm_transaction::svm_message::SVMMessage,
+        solana_stake_interface::program as stake_program,
         solana_transaction::{Transaction, sanitized::MAX_TX_ACCOUNT_LOCKS},
         solana_transaction_error::TransactionError,
         std::{
@@ -1396,6 +1475,8 @@ mod tests {
                     0,
                     &HashSet::new(),
                     AccountAddressFilter::Exclude,
+                    None,
+                    ScanOrigin::Other,
                 )
                 .unwrap(),
             vec![]
@@ -1408,6 +1489,8 @@ mod tests {
                     0,
                     &all_pubkeys,
                     AccountAddressFilter::Include,
+                    None,
+                    ScanOrigin::Other,
                 )
                 .unwrap(),
             vec![]
@@ -1423,6 +1506,8 @@ mod tests {
                     1,
                     &HashSet::new(),
                     AccountAddressFilter::Exclude,
+                    None,
+                    ScanOrigin::Other,
                 )
                 .unwrap(),
             vec![(pubkey1, 42)]
@@ -1435,6 +1520,8 @@ mod tests {
                     2,
                     &HashSet::new(),
                     AccountAddressFilter::Exclude,
+                    None,
+                    ScanOrigin::Other,
                 )
                 .unwrap(),
             vec![(pubkey1, 42), (pubkey0, 42)]
@@ -1447,6 +1534,8 @@ mod tests {
                     3,
                     &HashSet::new(),
                     AccountAddressFilter::Exclude,
+                    None,
+                    ScanOrigin::Other,
                 )
                 .unwrap(),
             vec![(pubkey1, 42), (pubkey0, 42), (pubkey2, 41)]
@@ -1461,6 +1550,8 @@ mod tests {
                     6,
                     &HashSet::new(),
                     AccountAddressFilter::Exclude,
+                    None,
+                    ScanOrigin::Other,
                 )
                 .unwrap(),
             vec![(pubkey1, 42), (pubkey0, 42), (pubkey2, 41)]
@@ -1476,6 +1567,8 @@ mod tests {
                     1,
                     &exclude1,
                     AccountAddressFilter::Exclude,
+                    None,
+                    ScanOrigin::Other,
                 )
                 .unwrap(),
             vec![(pubkey0, 42)]
@@ -1488,6 +1581,8 @@ mod tests {
                     2,
                     &exclude1,
                     AccountAddressFilter::Exclude,
+                    None,
+                    ScanOrigin::Other,
                 )
                 .unwrap(),
             vec![(pubkey0, 42), (pubkey2, 41)]
@@ -1500,6 +1595,8 @@ mod tests {
                     3,
                     &exclude1,
                     AccountAddressFilter::Exclude,
+                    None,
+                    ScanOrigin::Other,
                 )
                 .unwrap(),
             vec![(pubkey0, 42), (pubkey2, 41)]
@@ -1515,6 +1612,8 @@ mod tests {
                     1,
                     &include1_2,
                     AccountAddressFilter::Include,
+                    None,
+                    ScanOrigin::Other,
                 )
                 .unwrap(),
             vec![(pubkey1, 42)]
@@ -1527,6 +1626,8 @@ mod tests {
                     2,
                     &include1_2,
                     AccountAddressFilter::Include,
+                    None,
+                    ScanOrigin::Other,
                 )
                 .unwrap(),
             vec![(pubkey1, 42), (pubkey2, 41)]
@@ -1539,9 +1640,109 @@ mod tests {
                     3,
                     &include1_2,
                     AccountAddressFilter::Include,
+                    None,
+                    ScanOrigin::Other,
                 )
                 .unwrap(),
             vec![(pubkey1, 42), (pubkey2, 41)]
+        );
+    }
+
+    #[test]
+    fn test_load_largest_accounts_aborted_scan_returns_error() {
+        let accounts_db = AccountsDb::default_for_tests();
+        let accounts = Accounts::new(Arc::new(accounts_db));
+        let pubkey = Pubkey::new_unique();
+        accounts.store_for_tests(
+            0,
+            &pubkey,
+            &AccountSharedData::new(42, 0, &Pubkey::default()),
+        );
+
+        let abort = Arc::new(AtomicBool::new(true));
+        let result = accounts.load_largest_accounts(
+            &Ancestors::from(vec![0]),
+            0,
+            1,
+            &HashSet::new(),
+            AccountAddressFilter::Exclude,
+            Some(abort),
+            ScanOrigin::Other,
+        );
+
+        assert_eq!(
+            result,
+            Err(ScanError::Aborted(
+                "largest accounts scan aborted".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_load_by_index_key_with_abort_fallback_scan_returns_error() {
+        let stake_program_id = stake_program::id();
+        let mut indexed_keys = HashSet::new();
+        indexed_keys.insert(Pubkey::default());
+        let mut indexes = HashSet::new();
+        indexes.insert(crate::accounts_index::AccountIndex::ProgramId);
+        let accounts_db_config = crate::accounts_db::AccountsDbConfig {
+            account_indexes: Some(crate::accounts_index::AccountSecondaryIndexes {
+                keys: Some(
+                    crate::accounts_index::AccountSecondaryIndexesIncludeExclude {
+                        exclude: false,
+                        keys: indexed_keys,
+                    },
+                ),
+                indexes,
+            }),
+            ..Default::default()
+        };
+        let accounts_db = AccountsDb::new_for_tests_with_config(Vec::new(), accounts_db_config);
+        let accounts = Accounts::new(Arc::new(accounts_db));
+        for _ in 0..4 {
+            accounts.store_for_tests(
+                0,
+                &Pubkey::new_unique(),
+                &AccountSharedData::new(1, 0, &stake_program_id),
+            );
+        }
+        accounts.add_root_and_flush_write_cache(0);
+
+        assert!(
+            accounts
+                .accounts_db
+                .account_indexes
+                .contains(&crate::accounts_index::AccountIndex::ProgramId)
+        );
+        assert!(
+            !accounts
+                .accounts_db
+                .account_indexes
+                .include_key(&stake_program_id)
+        );
+
+        let abort = Arc::new(AtomicBool::new(false));
+        let abort_for_callback = Arc::clone(&abort);
+        let visited = AtomicUsize::new(0);
+        let result = accounts.load_by_index_key_with_filter_with_abort(
+            &Ancestors::from(vec![0]),
+            0,
+            &IndexKey::ProgramId(stake_program_id),
+            |_account| {
+                if visited.fetch_add(1, Ordering::Relaxed) == 0 {
+                    abort_for_callback.store(true, Ordering::Relaxed);
+                }
+                true
+            },
+            None,
+            Some(abort),
+            ScanOrigin::Other,
+        );
+
+        assert_eq!(visited.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            result,
+            Err(ScanError::Aborted("account scan aborted".to_string()))
         );
     }
 
